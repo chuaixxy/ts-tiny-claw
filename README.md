@@ -8,14 +8,16 @@ go-tiny-claw 的 TypeScript 实现版本。
 ts-tiny-claw/
 ├── cmd/
 │   └── claw/
-│       └── main.ts          # 程序入口
+│       └── main.ts          # 测试入口：将挂载 Mock 组件运行 Main Loop
 ├── internal/
-│   ├── engine/              # MainLoop 核心实现
-│   ├── provider/            # 大模型接口抽象与具体厂商 SDK 实现
-│   ├── context/             # Token 监控、Prompt 动态组装
-│   ├── tools/               # 工具注册表、Middleware、基础工具(bash/edit等)
-│   ├── memory/              # 基于文件系统的记忆状态存取
-│   └── feishu/              # 飞书机器人交互回调
+│   ├── engine/              # 【核心引擎层】
+│   │   └── loop.ts          # 本讲核心：Main Loop 逻辑
+│   ├── provider/            # 【模型适配层】
+│   │   └── interface.ts     # LLM Provider 接口定义
+│   ├── schema/              # 【公共数据结构】
+│   │   └── message.ts       # 统一的消息与工具调用类型定义
+│   └── tools/               # 【工具与执行层】
+│       └── registry.ts      # 工具注册与分发接口
 ├── package.json
 ├── tsconfig.json
 └── README.md

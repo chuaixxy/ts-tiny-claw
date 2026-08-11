@@ -2,6 +2,7 @@
   "name": "ts-tiny-claw",
   "version": "1.0.0",
   "description": "typescript tiny openclaw",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -9,6 +10,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0"
   }
 }

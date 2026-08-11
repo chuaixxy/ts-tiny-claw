@@ -1,6 +1,6 @@
-import type { LLMProvider } from "../provider/provider"
-import type { Message } from "../provider/schema"
-import type { Registry } from "../tools/registry"
+import type { LLMProvider } from "../provider/provider.ts"
+import type { Message } from "../provider/schema.ts"
+import type { Registry } from "../tools/registry.ts"
 
 /** AgentEngine 是微型 OS 的核心驱动 */
 export class AgentEngine {
@@ -43,11 +43,11 @@ export class AgentEngine {
       console.log(`========== [Turn ${turnCount}] 开始 ==========`)
 
       // 获取当前挂载的所有工具定义
-      const availableTools = this.registry.definitions()
+      const availableTools = this.registry.getAvailableTools()
 
       // 向大模型发起推理请求 (包含 Reasoning)
       console.log("[Engine] 正在思考 (Reasoning)...")
-      const responseMsg = await this.provider.generate(contextHistory, availableTools)
+      const responseMsg = await this.provider.generate(contextHistory, availableTools, signal)
 
       // 将模型的响应完整追加到上下文历史中
       contextHistory.push(responseMsg)
@@ -71,10 +71,7 @@ export class AgentEngine {
         console.log(`  -> 🛠️ 执行工具: ${toolCall.name}, 参数: ${JSON.stringify(toolCall.arguments)}`)
 
         // 通过 Registry 路由并执行底层工具
-        const tool = this.registry.get(toolCall.name)
-        const result = tool
-          ? await tool.execute(toolCall.arguments)
-          : { toolCallId: toolCall.id, output: `工具未找到: ${toolCall.name}`, isError: true }
+        const result = await this.registry.execute(toolCall, signal)
 
         if (result.isError) {
           console.log(`  -> ❌ 工具执行报错: ${result.output}`)
