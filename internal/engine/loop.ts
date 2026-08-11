@@ -9,16 +9,25 @@ export class AgentEngine {
 
   /** WorkDir (工作区): 借鉴 OpenClaw 的理念，Agent 必须有一个明确的物理边界 */
   readonly workDir: string
+  /** 慢思考模式开关 */
+  readonly enableThinking: boolean
 
-  constructor(provider: LLMProvider, registry: Registry, workDir: string) {
+  constructor(
+    provider: LLMProvider,
+    registry: Registry,
+    workDir: string,
+    enableThinking: boolean,
+  ) {
     this.provider = provider
     this.registry = registry
     this.workDir = workDir
+    this.enableThinking = enableThinking
   }
 
   /** 启动 Agent 的生命周期 */
   async run(ctx: AbortSignal | undefined, userPrompt: string): Promise<void> {
     console.log(`[Engine] 引擎启动，锁定工作区: ${this.workDir}`)
+    console.log(`[Engine] 慢思考模式 (Thinking Phase): ${this.enableThinking}`)
 
     // 1. 初始化会话的 Context (上下文内存)
     // 在真实的场景中，这里会由动态 Prompt 组装器加载 AGENTS.md。目前我们先硬编码。
@@ -40,34 +49,54 @@ export class AgentEngine {
       if (ctx?.aborted) break
 
       turnCount++
-      console.log(`========== [Turn ${turnCount}] 开始 ==========`)
+      console.log(`\n========== [Turn ${turnCount}] 开始 ==========`)
 
       // 获取当前挂载的所有工具定义
       const availableTools = this.registry.getAvailableTools()
 
-      // 向大模型发起推理请求 (包含 Reasoning)
-      console.log("[Engine] 正在思考 (Reasoning)...")
-      const responseMsg = await this.provider.generate(ctx, contextHistory, availableTools)
+      // ====================================================================
+      // Phase 1: 慢思考阶段 (Thinking) - 剥夺工具，强制规划
+      // ====================================================================
+      if (this.enableThinking) {
+        console.log("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
 
-      // 将模型的响应完整追加到上下文历史中
-      contextHistory.push(responseMsg)
+        // 核心机制：传入的 availableTools 为 undefined / 空！
+        // 大模型看不到任何 JSON Schema，被迫只能输出纯文本的思考过程。
+        const thinkResp = await this.provider.generate(ctx, contextHistory, undefined)
 
-      // 如果模型回复了纯文本，打印出来 (这通常是它的思考过程，或是最终结果)
-      if (responseMsg.content) {
-        console.log(`🤖 模型: ${responseMsg.content}`)
+        // 如果模型输出了思考过程，我们将其作为 Assistant 消息追加到上下文中
+        if (thinkResp.content) {
+          console.log(`🧠 [内部思考 Trace]: ${thinkResp.content}`)
+          contextHistory.push(thinkResp)
+        }
       }
 
-      // 3. 退出条件判断
-      // 如果模型没有请求任何工具调用，说明它认为任务已经完成，跳出循环。
-      if (!responseMsg.toolCalls || responseMsg.toolCalls.length === 0) {
-        console.log("[Engine] 任务完成，退出循环。")
+      // ====================================================================
+      // Phase 2: 行动阶段 (Action) - 恢复工具，顺着规划执行
+      // ====================================================================
+      console.log("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
+
+      // 此时的 contextHistory 中已经包含了上一阶段模型自己的 Thinking Trace。
+      // 模型会顺着自己的逻辑，结合恢复的 availableTools 发起精准的工具调用。
+      const actionResp = await this.provider.generate(ctx, contextHistory, availableTools)
+
+      contextHistory.push(actionResp)
+
+      if (actionResp.content) {
+        console.log(`🤖 [对外回复]: ${actionResp.content}`)
+      }
+
+      // ====================================================================
+      // 退出与执行逻辑
+      // ====================================================================
+      if (!actionResp.toolCalls || actionResp.toolCalls.length === 0) {
+        console.log("[Engine] 模型未请求调用工具，任务宣告完成。")
         break
       }
 
-      // 4. 执行行动 (Action) 与 获取观察结果 (Observation)
-      console.log(`[Engine] 模型请求调用 ${responseMsg.toolCalls.length} 个工具...`)
+      console.log(`[Engine] 模型请求调用 ${actionResp.toolCalls.length} 个工具...`)
 
-      for (const toolCall of responseMsg.toolCalls) {
+      for (const toolCall of actionResp.toolCalls) {
         console.log(`  -> 🛠️ 执行工具: ${toolCall.name}, 参数: ${JSON.stringify(toolCall.arguments)}`)
 
         // 通过 Registry 路由并执行底层工具
@@ -79,7 +108,7 @@ export class AgentEngine {
           console.log(`  -> ✅ 工具执行成功 (返回 ${result.output.length} 字节)`)
         }
 
-        // 将工具执行的观察结果 (Observation) 封装为 User Message 追加到上下文中
+        // 将工具执行的观察结果追加到 Context，准备进入下一轮
         // 注意：toolCallId 必须携带！这是维系大模型推理链条的关键
         const observationMsg: Message = {
           role: "user",

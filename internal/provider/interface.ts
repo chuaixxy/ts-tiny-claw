@@ -9,6 +9,6 @@ export interface LLMProvider {
   generate(
     ctx: AbortSignal | undefined,
     messages: Message[],
-    availableTools: ToolDefinition[],
+    availableTools: ToolDefinition[] | undefined,
   ): Promise<Message>
 }

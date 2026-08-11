@@ -11,22 +11,32 @@ import type {
 import type { Registry } from "../../internal/tools/registry.ts"
 
 // ==========================================
-// 1. 伪造的大模型 Provider
+// 1. 升级版 Mock Provider
 // ==========================================
 class MockProvider implements LLMProvider {
   private turn = 0
 
-  /** 模拟大模型的响应：第一轮请求执行 bash，第二轮输出最终结果 */
   async generate(
     _ctx: AbortSignal | undefined,
     _messages: Message[],
-    _availableTools: ToolDefinition[],
+    availableTools: ToolDefinition[] | undefined,
   ): Promise<Message> {
-    this.turn++
-    if (this.turn === 1) {
+    // 如果工具列表为空，说明这是引擎发起的 Phase 1: Thinking 阶段
+    if (!availableTools || availableTools.length === 0) {
       return {
         role: "assistant",
-        content: "让我来看看当前目录下有什么文件。",
+        content:
+          "【推理中】目标是检查文件。我不能直接盲猜，我需要先调用 bash 工具执行 ls 命令，看看当前目录下有什么，然后再做定夺。",
+      }
+    }
+
+    // 如果工具列表不为空，说明这是 Phase 2: Action 阶段
+    this.turn++
+    if (this.turn === 1) {
+      // 第一轮 Action：顺着刚才的 Thinking，精准调用工具
+      return {
+        role: "assistant",
+        content: "我要执行我刚才计划的步骤了。",
         toolCalls: [
           {
             id: "call_123",
@@ -37,9 +47,10 @@ class MockProvider implements LLMProvider {
       }
     }
 
+    // 第二轮 Action：直接总结退出
     return {
       role: "assistant",
-      content: "我看到了文件列表，里面包含 main.ts，任务完成！",
+      content: "根据工具返回的结果，我看到了 main.ts，任务圆满完成！",
     }
   }
 }
@@ -49,14 +60,25 @@ class MockProvider implements LLMProvider {
 // ==========================================
 class MockRegistry implements Registry {
   getAvailableTools(): ToolDefinition[] {
-    return []
+    // 为了让 Phase 2 能检测到工具，这里返回一个伪造的工具定义数组
+    return [
+      {
+        name: "bash",
+        description: "Execute a shell command",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: { type: "string" },
+          },
+        },
+      },
+    ]
   }
 
   async execute(_ctx: AbortSignal | undefined, call: ToolCall): Promise<ToolResult> {
-    // 直接返回一段伪造的终端输出
     return {
       toolCallId: call.id,
-      output: "-rw-r--r--  1 user group  234 Oct 24 10:00 main.go\n",
+      output: "-rw-r--r--  1 user group  234 Oct 24 10:00 main.ts\n",
       isError: false,
     }
   }
@@ -72,8 +94,8 @@ async function main() {
   const provider = new MockProvider()
   const registry = new MockRegistry()
 
-  // 实例化核心引擎
-  const eng = new AgentEngine(provider, registry, workDir)
+  // 实例化引擎，开启 enableThinking = true
+  const eng = new AgentEngine(provider, registry, workDir, true)
 
   // 发起任务指令
   try {
