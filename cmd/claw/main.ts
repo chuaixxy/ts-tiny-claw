@@ -1,9 +1,9 @@
 /* npx tsx cmd/claw/main.ts  */
 
 import { AgentEngine } from "../../internal/engine/loop.ts"
-import type { LLMProvider } from "../../internal/provider/interface.ts"
+import { createZhipuOpenAIProvider } from "../../internal/provider/openai.ts"
+// 也可换成 Claude 兼容端点：createZhipuClaudeProvider from "../../internal/provider/claude.ts"
 import type {
-  Message,
   ToolCall,
   ToolDefinition,
   ToolResult,
@@ -11,95 +11,64 @@ import type {
 import type { Registry } from "../../internal/tools/registry.ts"
 
 // ==========================================
-// 1. 升级版 Mock Provider
-// ==========================================
-class MockProvider implements LLMProvider {
-  private turn = 0
-
-  async generate(
-    _ctx: AbortSignal | undefined,
-    _messages: Message[],
-    availableTools: ToolDefinition[] | undefined,
-  ): Promise<Message> {
-    // 如果工具列表为空，说明这是引擎发起的 Phase 1: Thinking 阶段
-    if (!availableTools || availableTools.length === 0) {
-      return {
-        role: "assistant",
-        content:
-          "【推理中】目标是检查文件。我不能直接盲猜，我需要先调用 bash 工具执行 ls 命令，看看当前目录下有什么，然后再做定夺。",
-      }
-    }
-
-    // 如果工具列表不为空，说明这是 Phase 2: Action 阶段
-    this.turn++
-    if (this.turn === 1) {
-      // 第一轮 Action：顺着刚才的 Thinking，精准调用工具
-      return {
-        role: "assistant",
-        content: "我要执行我刚才计划的步骤了。",
-        toolCalls: [
-          {
-            id: "call_123",
-            name: "bash",
-            arguments: { command: "ls -la" },
-          },
-        ],
-      }
-    }
-
-    // 第二轮 Action：直接总结退出
-    return {
-      role: "assistant",
-      content: "根据工具返回的结果，我看到了 main.ts，任务圆满完成！",
-    }
-  }
-}
-
-// ==========================================
-// 2. 伪造的 Tool Registry
+// 1. 伪造的 Tool Registry（真实 Registry 稍后接入）
 // ==========================================
 class MockRegistry implements Registry {
   getAvailableTools(): ToolDefinition[] {
-    // 为了让 Phase 2 能检测到工具，这里返回一个伪造的工具定义数组
     return [
       {
-        name: "bash",
-        description: "Execute a shell command",
+        name: "get_weather",
+        description: "获取指定城市的当前天气情况。",
         inputSchema: {
           type: "object",
           properties: {
-            command: { type: "string" },
+            city: {
+              type: "string",
+            },
           },
+          required: ["city"],
         },
       },
     ]
   }
 
   async execute(_ctx: AbortSignal | undefined, call: ToolCall): Promise<ToolResult> {
+    console.log(`  -> [Mock 工具执行] 获取 ${call.name} 的天气中...`)
     return {
       toolCallId: call.id,
-      output: "-rw-r--r--  1 user group  234 Oct 24 10:00 main.ts\n",
+      output: "API 返回：今天是晴天，气温 25 度。",
       isError: false,
     }
   }
 }
 
 // ==========================================
-// 3. 组装运行
+// 2. 组装运行（Thinking ON / OFF 各跑一遍）
 // ==========================================
-async function main() {
-  // 获取当前执行目录作为 WorkDir 物理边界
+async function runOnce(enableThinking: boolean): Promise<void> {
+  const label = enableThinking ? "ON" : "OFF"
+  console.log("\n" + "=".repeat(60))
+  console.log(`[main] ========== enableThinking: ${label} ==========`)
+  console.log("=".repeat(60) + "\n")
+
   const workDir = process.cwd()
-
-  const provider = new MockProvider()
+  const llmProvider = createZhipuOpenAIProvider("glm-4.5-air")
   const registry = new MockRegistry()
+  const eng = new AgentEngine(llmProvider, registry, workDir, enableThinking)
 
-  // 实例化引擎，开启 enableThinking = true
-  const eng = new AgentEngine(provider, registry, workDir, true)
+  const prompt = "我想去北京跑步，帮我查查天气适合吗？"
+  await eng.run(undefined, prompt)
+}
 
-  // 发起任务指令
+async function main() {
+  if (!process.env.ZHIPU_API_KEY) {
+    console.error("请先导出 ZHIPU_API_KEY 环境变量")
+    process.exit(1)
+  }
+
   try {
-    await eng.run(undefined, "帮我检查当前目录的文件")
+    await runOnce(true)
+    await runOnce(false)
   } catch (err) {
     console.error("引擎崩溃:", err)
     process.exit(1)

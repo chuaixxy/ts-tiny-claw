@@ -10,6 +10,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.116.0",
+    "openai": "^7.4.0",
     "typescript": "^7.0.2",
     "zod": "^4.1.12"
   },
