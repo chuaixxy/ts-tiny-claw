@@ -18,9 +18,9 @@ class MockProvider implements LLMProvider {
 
   /** 模拟大模型的响应：第一轮请求执行 bash，第二轮输出最终结果 */
   async generate(
+    _ctx: AbortSignal | undefined,
     _messages: Message[],
     _availableTools: ToolDefinition[],
-    _signal?: AbortSignal,
   ): Promise<Message> {
     this.turn++
     if (this.turn === 1) {
@@ -39,7 +39,7 @@ class MockProvider implements LLMProvider {
 
     return {
       role: "assistant",
-      content: "我看到了文件列表，里面包含 main.go，任务完成！",
+      content: "我看到了文件列表，里面包含 main.ts，任务完成！",
     }
   }
 }
@@ -52,7 +52,7 @@ class MockRegistry implements Registry {
     return []
   }
 
-  async execute(call: ToolCall, _signal?: AbortSignal): Promise<ToolResult> {
+  async execute(_ctx: AbortSignal | undefined, call: ToolCall): Promise<ToolResult> {
     // 直接返回一段伪造的终端输出
     return {
       toolCallId: call.id,
@@ -77,7 +77,7 @@ async function main() {
 
   // 发起任务指令
   try {
-    await eng.run("帮我检查当前目录的文件")
+    await eng.run(undefined, "帮我检查当前目录的文件")
   } catch (err) {
     console.error("引擎崩溃:", err)
     process.exit(1)

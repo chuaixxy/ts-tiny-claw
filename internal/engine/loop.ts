@@ -17,7 +17,7 @@ export class AgentEngine {
   }
 
   /** 启动 Agent 的生命周期 */
-  async run(userPrompt: string, signal?: AbortSignal): Promise<void> {
+  async run(ctx: AbortSignal | undefined, userPrompt: string): Promise<void> {
     console.log(`[Engine] 引擎启动，锁定工作区: ${this.workDir}`)
 
     // 1. 初始化会话的 Context (上下文内存)
@@ -37,7 +37,7 @@ export class AgentEngine {
 
     // 2. The Main Loop: 心跳开始 (标准的 ReAct 循环)
     while (true) {
-      if (signal?.aborted) break
+      if (ctx?.aborted) break
 
       turnCount++
       console.log(`========== [Turn ${turnCount}] 开始 ==========`)
@@ -47,7 +47,7 @@ export class AgentEngine {
 
       // 向大模型发起推理请求 (包含 Reasoning)
       console.log("[Engine] 正在思考 (Reasoning)...")
-      const responseMsg = await this.provider.generate(contextHistory, availableTools, signal)
+      const responseMsg = await this.provider.generate(ctx, contextHistory, availableTools)
 
       // 将模型的响应完整追加到上下文历史中
       contextHistory.push(responseMsg)
@@ -71,7 +71,7 @@ export class AgentEngine {
         console.log(`  -> 🛠️ 执行工具: ${toolCall.name}, 参数: ${JSON.stringify(toolCall.arguments)}`)
 
         // 通过 Registry 路由并执行底层工具
-        const result = await this.registry.execute(toolCall, signal)
+        const result = await this.registry.execute(ctx, toolCall)
 
         if (result.isError) {
           console.log(`  -> ❌ 工具执行报错: ${result.output}`)

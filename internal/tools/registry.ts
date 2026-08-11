@@ -7,7 +7,7 @@ export interface Registry {
 
   /**
    * Execute 实际执行模型请求的工具，并返回结果。
-   * signal 对应 Go 的 context.Context，用于请求取消。
+   * ctx 对应 Go 的 context.Context，用于请求取消。
    */
-  execute(call: ToolCall, signal?: AbortSignal): Promise<ToolResult>
+  execute(ctx: AbortSignal | undefined, toolCall: ToolCall): Promise<ToolResult>
 }
