@@ -95,31 +95,47 @@ export class AgentEngine {
         break
       }
 
-      log(`[Engine] 模型请求调用 ${actionResp.toolCalls.length} 个工具...`)
+      log(`[Engine] 模型请求并发调用 ${actionResp.toolCalls.length} 个工具...`)
 
-      for (const toolCall of actionResp.toolCalls) {
-        log(`  -> 🛠️ 执行工具: ${toolCall.name}, 参数: ${JSON.stringify(toolCall.arguments)}`)
+      // 【核心改造】: 从串行 (Sequential) 演进为并行 (Parallel)
+      //
+      // 三个驾驭工程细节（对应 Go 的 Goroutine + WaitGroup 实践）：
+      // 1) 并发安全 / 闭包陷阱：用 map(async (toolCall, idx) => ...) 传参，
+      //    每次回调自带绑定，等价于 go func(idx, call)，不会抢到最后一个循环变量。
+      // 2) 无锁设计：预分配 observationMsgs，每个 Promise 只写自己的 idx 坑位，
+      //    无需 Mutex；Node 虽是单线程事件循环，这套结构仍保证清晰与可预测。
+      // 3) 上下文顺序对齐：模型返回 [ToolA, ToolB] 时期望 [ResultA, ResultB]；
+      //    全部完成后再按索引顺序 push，避免乱序追加造成阅读混乱。
+      const observationMsgs: Message[] = new Array(actionResp.toolCalls.length)
 
-        // 通过 Registry 路由并执行底层工具
-        const result = await this.registry.execute(ctx, toolCall)
+      // Promise.all ≈ sync.WaitGroup.Wait()：并发跑完再继续
+      await Promise.all(
+        actionResp.toolCalls.map(async (toolCall, idx) => {
+          log(`  -> [Go-${idx}] 🛠️ 触发并行执行: ${toolCall.name}`)
 
-        if (result.isError) {
-          log(`  -> ❌ 工具执行报错: ${result.output}`)
-        } else {
-          log(`  -> ✅ 工具执行成功 (返回 ${result.output.length} 字节)`)
-        }
+          const result = await this.registry.execute(ctx, toolCall)
 
-        // 将工具执行的观察结果追加到 Context，准备进入下一轮
-        // 注意：toolCallId 必须携带！这是维系大模型推理链条的关键
-        const observationMsg: Message = {
-          role: "user",
-          content: result.output,
-          toolCallId: toolCall.id,
-        }
-        contextHistory.push(observationMsg)
-      }
+          if (result.isError) {
+            log(`  -> [Go-${idx}] ❌ 工具执行报错: ${result.output}`)
+          } else {
+            log(`  -> [Go-${idx}] ✅ 工具执行成功 (返回 ${result.output.length} 字节)`)
+          }
 
-      // 循环回到开头，模型将带着新加入的 Observation 继续它的下一轮思考...
+          // 专属 idx 坑位写入（无锁、保序）
+          observationMsgs[idx] = {
+            role: "user",
+            content: result.output,
+            toolCallId: toolCall.id,
+          }
+        }),
+      )
+
+      log("[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...")
+
+      // 按原始 ToolCall 顺序一次性追加到上下文时间线
+      contextHistory.push(...observationMsgs)
+
+      // 循环回到开头，模型将带着这一批新的 Observation 继续它的下一轮思考...
     }
   }
 }

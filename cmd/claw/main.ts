@@ -36,26 +36,21 @@ async function main() {
 
   const model = process.env.LLM_MODEL ?? "glm-4.5-air"
   const llmProvider = createOpenAIProvider(model)
-  const registry = createRegistry()
 
-  // 挂载工具全家桶
+  const registry = createRegistry()
   registry.register(createReadFileTool(workDir))
+  // 挂载其他的极简工具
   registry.register(createWriteFileTool(workDir))
   registry.register(createBashTool(workDir))
-  // 【新增挂载】
   registry.register(createEditFileTool(workDir))
 
-  // 实例化引擎（EnableThinking = false）
-  const eng = new AgentEngine(llmProvider, registry, workDir, false)
+  // 实例化引擎，开启 EnableThinking = true (开启慢思考，促使模型一次性统筹规划)
+  const eng = new AgentEngine(llmProvider, registry, workDir, true)
 
-  // 发起一个需要局部修改的指令
+  // 下发一个需要收集多源信息的任务
   const prompt = `
-    我当前目录下有一个 server.ts 文件。
-    请帮我把里面 "TODO: 增加鉴权逻辑" 下面的那个 if 语句，整个替换为：
-    if (user == null) {
-      console.log("Forbidden!");
-      return;
-    }
+    我当前目录下有 a.txt, b.txt, c.txt 三个文件。
+    为了节省时间，请你同时一次性读取这三个文件，并将它们的内容综合起来，告诉我它们分别记录了什么领域的信息。
     `
 
   try {
