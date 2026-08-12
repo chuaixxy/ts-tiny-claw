@@ -92,8 +92,10 @@ export class OpenAIProvider implements LLMProvider {
       { signal: ctx },
     )
 
-    if (resp.choices.length === 0) {
-      throw new Error("API 返回了空的 Choices")
+    if (!resp?.choices || resp.choices.length === 0) {
+      throw new Error(
+        `API 未返回有效 choices（请检查 LLM_BASE_URL 是否包含 /v1 等版本前缀）。原始响应: ${JSON.stringify(resp).slice(0, 500)}`,
+      )
     }
 
     // 4. 将 API Response 反向翻译为内部 Message
@@ -123,15 +125,26 @@ export class OpenAIProvider implements LLMProvider {
   }
 }
 
-/** 构造函数：基于 OpenAI SDK，指向智谱兼容端点 */
-export function createZhipuOpenAIProvider(model: string): OpenAIProvider {
-  const apiKey = process.env.ZHIPU_API_KEY
+export type CompatibleProviderOptions = {
+  apiKey?: string
+  /** OpenAI 兼容端点，默认读 LLM_BASE_URL（智谱 / DeepSeek / 豆包等均可） */
+  baseURL?: string
+}
+
+/** 构造函数：基于 OpenAI SDK，指向任意 OpenAI 兼容端点 */
+export function createOpenAIProvider(
+  model: string,
+  options?: CompatibleProviderOptions,
+): OpenAIProvider {
+  const apiKey = options?.apiKey ?? process.env.LLM_API_KEY
   if (!apiKey) {
-    throw new Error("请设置 ZHIPU_API_KEY 环境变量")
+    throw new Error("请设置 LLM_API_KEY 环境变量")
   }
 
-  // 核心：将官方 SDK 的地址替换为智谱的兼容端点
-  const baseURL = "https://open.bigmodel.cn/api/paas/v4/"
+  const baseURL = options?.baseURL ?? process.env.LLM_BASE_URL
+  if (!baseURL) {
+    throw new Error("请设置 LLM_BASE_URL 环境变量")
+  }
 
   return new OpenAIProvider(
     new OpenAI({

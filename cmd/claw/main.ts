@@ -1,76 +1,57 @@
 /* npx tsx cmd/claw/main.ts  */
 
+import { existsSync } from "node:fs"
+import path from "node:path"
+
 import { AgentEngine } from "../../internal/engine/loop.ts"
-import { createZhipuOpenAIProvider } from "../../internal/provider/openai.ts"
-// 也可换成 Claude 兼容端点：createZhipuClaudeProvider from "../../internal/provider/claude.ts"
-import type {
-  ToolCall,
-  ToolDefinition,
-  ToolResult,
-} from "../../internal/schema/message.ts"
-import type { Registry } from "../../internal/tools/registry.ts"
+import { createOpenAIProvider } from "../../internal/provider/openai.ts"
+// 也可换成 Claude 兼容端点：createClaudeProvider from "../../internal/provider/claude.ts"
+import { createReadFileTool } from "../../internal/tools/read-file.ts"
+import { createRegistry } from "../../internal/tools/registry.ts"
 
-// ==========================================
-// 1. 伪造的 Tool Registry（真实 Registry 稍后接入）
-// ==========================================
-class MockRegistry implements Registry {
-  getAvailableTools(): ToolDefinition[] {
-    return [
-      {
-        name: "get_weather",
-        description: "获取指定城市的当前天气情况。",
-        inputSchema: {
-          type: "object",
-          properties: {
-            city: {
-              type: "string",
-            },
-          },
-          required: ["city"],
-        },
-      },
-    ]
-  }
-
-  async execute(_ctx: AbortSignal | undefined, call: ToolCall): Promise<ToolResult> {
-    console.log(`  -> [Mock 工具执行] 获取 ${call.name} 的天气中...`)
-    return {
-      toolCallId: call.id,
-      output: "API 返回：今天是晴天，气温 25 度。",
-      isError: false,
-    }
-  }
+/** Node 不会自动读 .env，启动时从工作区根目录加载 */
+function loadDotEnv(): void {
+  const envPath = path.resolve(process.cwd(), ".env")
+  if (!existsSync(envPath)) return
+  process.loadEnvFile(envPath)
 }
 
-// ==========================================
-// 2. 组装运行（Thinking ON / OFF 各跑一遍）
-// ==========================================
-async function runOnce(enableThinking: boolean): Promise<void> {
-  const label = enableThinking ? "ON" : "OFF"
-  console.log("\n" + "=".repeat(60))
-  console.log(`[main] ========== enableThinking: ${label} ==========`)
-  console.log("=".repeat(60) + "\n")
-
-  const workDir = process.cwd()
-  const llmProvider = createZhipuOpenAIProvider("glm-4.5-air")
-  const registry = new MockRegistry()
-  const eng = new AgentEngine(llmProvider, registry, workDir, enableThinking)
-
-  const prompt = "我想去北京跑步，帮我查查天气适合吗？"
-  await eng.run(undefined, prompt)
-}
+loadDotEnv()
 
 async function main() {
-  if (!process.env.ZHIPU_API_KEY) {
-    console.error("请先导出 ZHIPU_API_KEY 环境变量")
+  if (!process.env.LLM_API_KEY) {
+    console.error("请先设置 LLM_API_KEY 环境变量（可写在项目根目录 .env）")
+    process.exit(1)
+  }
+  if (!process.env.LLM_BASE_URL) {
+    console.error("请先设置 LLM_BASE_URL 环境变量（可写在项目根目录 .env）")
     process.exit(1)
   }
 
+  // 1. 获取工作区物理边界
+  const workDir = process.cwd()
+
+  // 2. 初始化真实的大脑（任意 OpenAI 兼容端点：智谱 / DeepSeek / 豆包等）
+  const model = process.env.LLM_MODEL ?? "glm-4.5-air"
+  const llmProvider = createOpenAIProvider(model)
+
+  // 3. 初始化真实的 Tool Registry
+  const registry = createRegistry()
+
+  // 4. 将真实的 ReadFile 工具挂载到注册表中
+  registry.register(createReadFileTool(workDir))
+
+  // 5. 实例化核心引擎，由于任务简单，关闭思考阶段以加快速度
+  const eng = new AgentEngine(llmProvider, registry, workDir, false)
+
+  // 6. 下发一个必须通过真实工具才能完成的任务
+  const prompt =
+    "请调用工具读取一下当前工作区目录下 hello.txt 文件的内容，并用一句话向我总结它说了什么。"
+
   try {
-    await runOnce(true)
-    await runOnce(false)
+    await eng.run(undefined, prompt)
   } catch (err) {
-    console.error("引擎崩溃:", err)
+    console.error("引擎运行崩溃:", err)
     process.exit(1)
   }
 }

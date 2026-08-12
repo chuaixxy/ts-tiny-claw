@@ -152,14 +152,26 @@ export class ClaudeProvider implements LLMProvider {
   }
 }
 
-/** 构造函数：基于 Anthropic SDK，指向智谱兼容端点 */
-export function createZhipuClaudeProvider(model: string): ClaudeProvider {
-  const apiKey = process.env.ZHIPU_API_KEY
+export type CompatibleProviderOptions = {
+  apiKey?: string
+  /** Anthropic 兼容端点，默认读 LLM_BASE_URL（智谱等兼容端点均可） */
+  baseURL?: string
+}
+
+/** 构造函数：基于 Anthropic SDK，指向任意 Anthropic 兼容端点 */
+export function createClaudeProvider(
+  model: string,
+  options?: CompatibleProviderOptions,
+): ClaudeProvider {
+  const apiKey = options?.apiKey ?? process.env.LLM_API_KEY
   if (!apiKey) {
-    throw new Error("请设置 ZHIPU_API_KEY 环境变量")
+    throw new Error("请设置 LLM_API_KEY 环境变量")
   }
 
-  const baseURL = "https://open.bigmodel.cn/api/paas/v4/"
+  const baseURL = options?.baseURL ?? process.env.LLM_BASE_URL
+  if (!baseURL) {
+    throw new Error("请设置 LLM_BASE_URL 环境变量")
+  }
 
   return new ClaudeProvider(
     new Anthropic({
