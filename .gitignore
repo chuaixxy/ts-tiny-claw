@@ -27,3 +27,6 @@ Thumbs.db
 # Coverage / test
 coverage/
 .nyc_output/
+
+# Agent 运行时工作区（内含独立 .git，供演示 git commit；勿嵌入主仓库）
+/workspace/

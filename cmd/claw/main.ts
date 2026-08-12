@@ -3,10 +3,11 @@
 //
 // Node 提供三种对话入口（互斥，由 argv / CLAW_MODE 选择）：
 //
-//   cli      终端 REPL —— 不依赖飞书 EventListener / Webhook / 长连接
+//   cli      终端一次性任务（默认 EnableThinking=true；无参数时跑 Go 演示 prompt）
 //            用法: npx tsx cmd/claw/main.ts
-//                  npx tsx cmd/claw/main.ts cli
 //                  npx tsx cmd/claw/main.ts cli "读取 a.txt 并总结"
+//   repl     终端交互 REPL
+//            用法: npx tsx cmd/claw/main.ts repl
 //
 //   webhook  飞书 HTTP 事件订阅（需公网 URL，对应 Go ListenAndServe）
 //            用法: npx tsx cmd/claw/main.ts webhook
@@ -15,7 +16,7 @@
 //            开放平台选「使用长连接接收事件」，本地无需公网入口
 //            用法: npx tsx cmd/claw/main.ts ws
 
-import { existsSync } from "node:fs"
+import { existsSync, mkdirSync } from "node:fs"
 import http from "node:http"
 import path from "node:path"
 import * as readline from "node:readline/promises"
@@ -24,7 +25,7 @@ import { stdin as input, stdout as output } from "node:process"
 import * as lark from "@larksuiteoapi/node-sdk"
 
 import { AgentEngine } from "../../internal/engine/loop.ts"
-import type { Reporter } from "../../internal/engine/reporter.ts"
+import { createTerminalReporter } from "../../internal/engine/terminal-reporter.ts"
 import { createFeishuBot } from "../../internal/feishu/bot.ts"
 import { error as logError, log } from "../../internal/log/log.ts"
 import { createOpenAIProvider } from "../../internal/provider/openai.ts"
@@ -46,7 +47,11 @@ loadDotEnv()
 
 type RunMode = "cli" | "webhook" | "ws"
 
-function parseMode(argv: string[]): { mode: RunMode; oneShotPrompt?: string } {
+function parseMode(argv: string[]): {
+  mode: RunMode
+  oneShotPrompt?: string
+  interactive?: boolean
+} {
   // 优先 CLAW_MODE；否则看第一个参数；默认 cli（本地对话、不依赖飞书）
   const envMode = process.env.CLAW_MODE?.trim().toLowerCase()
   const arg0 = argv[0]?.toLowerCase()
@@ -58,53 +63,39 @@ function parseMode(argv: string[]): { mode: RunMode; oneShotPrompt?: string } {
   if (raw === "ws" || raw === "websocket" || raw === "long-connection") {
     return { mode: "ws" }
   }
-  if (raw === "cli" || raw === "repl" || raw === "chat") {
-    // npx tsx cmd/claw/main.ts cli "一次性任务"
-    const oneShot =
-      argv[0] && ["cli", "repl", "chat"].includes(argv[0].toLowerCase())
-        ? argv.slice(1).join(" ").trim()
-        : argv.join(" ").trim()
+  // repl / chat：交互式；cli 或不带模式：一次性（默认跑 Go 演示 prompt）
+  if (raw === "repl" || raw === "chat") {
+    return { mode: "cli", interactive: true }
+  }
+  if (raw === "cli") {
+    const oneShot = argv.slice(1).join(" ").trim()
     return oneShot
       ? { mode: "cli", oneShotPrompt: oneShot }
       : { mode: "cli" }
   }
 
   // 未识别的首参：当作 cli 的一次性 prompt（方便 npx tsx cmd/claw/main.ts 帮我读 a.txt）
-  if (arg0 && !["webhook", "feishu", "http", "ws", "websocket", "long-connection"].includes(arg0)) {
+  if (
+    arg0 &&
+    !["webhook", "feishu", "http", "ws", "websocket", "long-connection"].includes(
+      arg0,
+    )
+  ) {
     return { mode: "cli", oneShotPrompt: argv.join(" ").trim() }
   }
 
   return { mode: "cli" }
 }
 
-/** 终端 Reporter：对齐飞书 FeishuReporter 的轻量气泡，避免和引擎 verbose 日志叠成两层 */
-function createCliReporter(): Reporter {
-  return {
-    onThinking: () => {
-      // 仅发一个轻量级提示，避免刷屏（同 FeishuReporter.OnThinking）
-      log("🤔 模型正在慢思考 (Thinking)...")
-    },
-    onToolCall: (_ctx, toolName, args) => {
-      log(`🛠️ **正在执行工具**：\`${toolName}\`\n参数：\`${args}\``)
-    },
-    onToolResult: (_ctx, toolName, result, isError) => {
-      if (isError) {
-        log(`⚠️ **执行报错** (${toolName})：\n${result}`)
-      } else {
-        // 成功时仅汇报成功，不刷全量日志（同 FeishuReporter）
-        log(`✅ **执行成功** (${toolName})`)
-      }
-    },
-    onMessage: (_ctx, content) => {
-      // 将模型最终的纯文本回答发给用户
-      log(`\n💬 ${content}\n`)
-    },
-  }
-}
-
 /** 1. 初始化引擎依赖（各入口共用） */
 function createEngine(): AgentEngine {
-  const workDir = process.cwd()
+  // 对应 Go:
+  //   workDir, _ := os.Getwd()
+  //   workDir += "/workspace"
+  const workDir = path.join(process.cwd(), "workspace")
+  if (!existsSync(workDir)) {
+    mkdirSync(workDir, { recursive: true })
+  }
 
   // 默认使用智谱 GLM-4（Go 检查 ZHIPU_API_KEY；本仓库统一用 OpenAI 兼容的 LLM_*）
   if (!process.env.LLM_API_KEY) {
@@ -126,48 +117,70 @@ function createEngine(): AgentEngine {
   registry.register(createBashTool(workDir))
   registry.register(createEditFileTool(workDir))
 
-  // 开启慢思考
+  // 实例化引擎，开启慢思考
   // 对应 Go: eng := engine.NewAgentEngine(llmProvider, registry, workDir, true)
-  return new AgentEngine(llmProvider, registry, workDir, true)
+  // EnableThinking = true：Phase 1 剥夺工具，强制规划后再行动
+  const enableThinking = true
+  return new AgentEngine(llmProvider, registry, workDir, enableThinking)
 }
 
 /**
+ * 对应 Go main 里的默认演示任务：测动态 Prompt + TerminalReporter。
+ * 无自定义 prompt 时跑这一条；交互 REPL 请用: npx tsx cmd/claw/main.ts repl
+ */
+const DEFAULT_DEMO_PROMPT = `
+    我需要在当前目录下新建一个 ping.js（Node.js），提供一个简单的 http ping 接口。
+    写完之后，帮我把代码用 git 提交一下。
+    `
+
+/**
  * CLI 入口：不用飞书 EventListener，直接在终端和 Agent 对话。
- * Reporter 打到 stdout；可一次性 prompt，也可 REPL 多轮（每轮独立 run）。
+ * 【注入新实现的终端输出器】对应 Go: reporter := engine.NewTerminalReporter()
  */
 async function runCli(
   eng: AgentEngine,
   oneShotPrompt?: string,
+  interactive = false,
 ): Promise<void> {
-  const reporter = createCliReporter()
+  // 【注入新实现的终端输出器】
+  const reporter = createTerminalReporter()
 
-  if (oneShotPrompt) {
-    log(`[CLI] 一次性任务: ${oneShotPrompt}`)
-    await eng.run(undefined, oneShotPrompt, reporter)
+  if (interactive) {
+    log("🚀 ts-tiny-claw CLI REPL（EnableThinking=true，工作区 workspace/）")
+    log("   输入任务后回车；空行或 exit / quit 退出")
+    log("   其他入口: npx tsx cmd/claw/main.ts webhook | ws")
+    log("   调试引擎内部轨迹: CLAW_VERBOSE=1 npx tsx cmd/claw/main.ts")
+
+    const rl = readline.createInterface({ input, output })
+    try {
+      while (true) {
+        const line = (await rl.question("\n你> ")).trim()
+        if (!line || line === "exit" || line === "quit") {
+          log("[CLI] 再见")
+          break
+        }
+        try {
+          await eng.run(undefined, line, reporter)
+        } catch (err) {
+          logError("[CLI] 引擎运行崩溃:", err)
+        }
+      }
+    } finally {
+      rl.close()
+    }
     return
   }
 
-  log("🚀 ts-tiny-claw CLI 已启动（无需飞书事件订阅）")
-  log("   输入任务后回车；空行或 exit / quit 退出")
-  log("   其他入口: npx tsx cmd/claw/main.ts webhook | ws")
-  log("   调试引擎内部轨迹: CLAW_VERBOSE=1 npx tsx cmd/claw/main.ts")
-
-  const rl = readline.createInterface({ input, output })
+  // 对应 Go: err := eng.Run(context.Background(), prompt, reporter)
+  const prompt = oneShotPrompt?.trim() || DEFAULT_DEMO_PROMPT
+  log(`[CLI] EnableThinking=true，工作区=${eng.workDir}`)
+  log(`[CLI] 任务:\n${prompt}`)
   try {
-    while (true) {
-      const line = (await rl.question("\n你> ")).trim()
-      if (!line || line === "exit" || line === "quit") {
-        log("[CLI] 再见")
-        break
-      }
-      try {
-        await eng.run(undefined, line, reporter)
-      } catch (err) {
-        logError("[CLI] 引擎运行崩溃:", err)
-      }
-    }
-  } finally {
-    rl.close()
+    await eng.run(undefined, prompt, reporter)
+  } catch (err) {
+    // 对应 Go: log.Fatalf("引擎运行崩溃: %v", err)
+    logError("引擎运行崩溃:", err)
+    process.exit(1)
   }
 }
 
@@ -235,12 +248,12 @@ async function runFeishuLongConnection(eng: AgentEngine): Promise<void> {
 }
 
 async function main() {
-  const { mode, oneShotPrompt } = parseMode(process.argv.slice(2))
+  const { mode, oneShotPrompt, interactive } = parseMode(process.argv.slice(2))
   const eng = createEngine()
 
   switch (mode) {
     case "cli":
-      await runCli(eng, oneShotPrompt)
+      await runCli(eng, oneShotPrompt, interactive === true)
       break
     case "webhook":
       await runFeishuWebhook(eng)

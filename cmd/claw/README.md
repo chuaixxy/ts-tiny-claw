@@ -20,9 +20,10 @@ CLAW_MODE=cli|webhook|ws npx tsx cmd/claw/main.ts
 
 | 模式 | 命令 | 要不要飞书 | 说明 |
 |------|------|------------|------|
-| **cli**（默认） | `npx tsx cmd/claw/main.ts` | 否 | 终端 REPL，不依赖事件订阅 |
-| **cli** 一次性 | `npx tsx cmd/claw/main.ts cli "任务…"` | 否 | 跑完一轮就退出 |
-| **webhook** | `npx tsx cmd/claw/main.ts webhook` | 要（HTTP 推事件） | 对齐 Go：监听 `/webhook/event` |
+| **cli**（默认） | `npx tsx cmd/claw/main.ts` | 否 | 一次性任务；`EnableThinking=true`；工作区 `workspace/`；无参数时跑演示 prompt（`ping.js` Node HTTP + git） |
+| **cli** 自定义 | `npx tsx cmd/claw/main.ts cli "任务…"` | 否 | 指定一次性 prompt |
+| **repl** | `npx tsx cmd/claw/main.ts repl` | 否 | 交互多轮 |
+| **webhook** | `npx tsx cmd/claw/main.ts webhook` | 要（HTTP 推事件） | 对齐 Go 飞书章节：监听 `/webhook/event` |
 | **ws** | `npx tsx cmd/claw/main.ts ws` | 要（长连接） | 不用公网 Webhook URL |
 
 别名（等价）：
