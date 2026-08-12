@@ -8,6 +8,7 @@ import { error as logError } from "../../internal/log/log.ts"
 import { createOpenAIProvider } from "../../internal/provider/openai.ts"
 // 也可换成 Claude 兼容端点：createClaudeProvider from "../../internal/provider/claude.ts"
 import { createBashTool } from "../../internal/tools/bash.ts"
+import { createEditFileTool } from "../../internal/tools/edit-file.ts"
 import { createReadFileTool } from "../../internal/tools/read-file.ts"
 import { createRegistry } from "../../internal/tools/registry.ts"
 import { createWriteFileTool } from "../../internal/tools/write-file.ts"
@@ -37,20 +38,24 @@ async function main() {
   const llmProvider = createOpenAIProvider(model)
   const registry = createRegistry()
 
-  // 挂载极简工具集
+  // 挂载工具全家桶
   registry.register(createReadFileTool(workDir))
   registry.register(createWriteFileTool(workDir))
   registry.register(createBashTool(workDir))
+  // 【新增挂载】
+  registry.register(createEditFileTool(workDir))
 
-  // 实例化核心引擎，关闭慢思考阶段，享受 YOLO 急速模式
+  // 实例化引擎（EnableThinking = false）
   const eng = new AgentEngine(llmProvider, registry, workDir, false)
 
-  // 发起一个需要连贯物理动作的任务
+  // 发起一个需要局部修改的指令
   const prompt = `
-    请帮我执行以下操作：
-    1. 用 bash 查看一下我当前电脑的 Node 版本。
-    2. 帮我写一个简单的 helloworld.js 文件，输出 "Hello, ts-tiny-claw!"。
-    3. 用 bash 运行这个 js 文件，确认它能正常工作。
+    我当前目录下有一个 server.ts 文件。
+    请帮我把里面 "TODO: 增加鉴权逻辑" 下面的那个 if 语句，整个替换为：
+    if (user == null) {
+      console.log("Forbidden!");
+      return;
+    }
     `
 
   try {
