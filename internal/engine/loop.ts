@@ -1,3 +1,4 @@
+import { log } from "../log/log.ts"
 import type { LLMProvider } from "../provider/provider.ts"
 import type { Message } from "../provider/schema.ts"
 import type { Registry } from "../tools/registry.ts"
@@ -26,8 +27,8 @@ export class AgentEngine {
 
   /** 启动 Agent 的生命周期 */
   async run(ctx: AbortSignal | undefined, userPrompt: string): Promise<void> {
-    console.log(`[Engine] 引擎启动，锁定工作区: ${this.workDir}`)
-    console.log(`[Engine] 慢思考模式 (Thinking Phase): ${this.enableThinking}`)
+    log(`[Engine] 引擎启动，锁定工作区: ${this.workDir}`)
+    log(`[Engine] 慢思考模式 (Thinking Phase): ${this.enableThinking}`)
 
     // 1. 初始化会话的 Context (上下文内存)
     // 在真实的场景中，这里会由动态 Prompt 组装器加载 AGENTS.md。目前我们先硬编码。
@@ -49,7 +50,7 @@ export class AgentEngine {
       if (ctx?.aborted) break
 
       turnCount++
-      console.log(`\n========== [Turn ${turnCount}] 开始 ==========`)
+      log(`\n========== [Turn ${turnCount}] 开始 ==========`)
 
       // 获取当前挂载的所有工具定义
       const availableTools = this.registry.getAvailableTools()
@@ -58,7 +59,7 @@ export class AgentEngine {
       // Phase 1: 慢思考阶段 (Thinking) - 剥夺工具，强制规划
       // ====================================================================
       if (this.enableThinking) {
-        console.log("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
+        log("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
 
         // 核心机制：传入的 availableTools 为 undefined / 空！
         // 大模型看不到任何 JSON Schema，被迫只能输出纯文本的思考过程。
@@ -66,7 +67,7 @@ export class AgentEngine {
 
         // 如果模型输出了思考过程，我们将其作为 Assistant 消息追加到上下文中
         if (thinkResp.content) {
-          console.log(`🧠 [内部思考 Trace]: ${thinkResp.content}`)
+          log(`🧠 [内部思考 Trace]: ${thinkResp.content}`)
           contextHistory.push(thinkResp)
         }
       }
@@ -74,7 +75,7 @@ export class AgentEngine {
       // ====================================================================
       // Phase 2: 行动阶段 (Action) - 恢复工具，顺着规划执行
       // ====================================================================
-      console.log("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
+      log("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
 
       // 此时的 contextHistory 中已经包含了上一阶段模型自己的 Thinking Trace。
       // 模型会顺着自己的逻辑，结合恢复的 availableTools 发起精准的工具调用。
@@ -83,29 +84,29 @@ export class AgentEngine {
       contextHistory.push(actionResp)
 
       if (actionResp.content) {
-        console.log(`🤖 [对外回复]: ${actionResp.content}`)
+        log(`🤖 [对外回复]: ${actionResp.content}`)
       }
 
       // ====================================================================
       // 退出与执行逻辑
       // ====================================================================
       if (!actionResp.toolCalls || actionResp.toolCalls.length === 0) {
-        console.log("[Engine] 模型未请求调用工具，任务宣告完成。")
+        log("[Engine] 模型未请求调用工具，任务宣告完成。")
         break
       }
 
-      console.log(`[Engine] 模型请求调用 ${actionResp.toolCalls.length} 个工具...`)
+      log(`[Engine] 模型请求调用 ${actionResp.toolCalls.length} 个工具...`)
 
       for (const toolCall of actionResp.toolCalls) {
-        console.log(`  -> 🛠️ 执行工具: ${toolCall.name}, 参数: ${JSON.stringify(toolCall.arguments)}`)
+        log(`  -> 🛠️ 执行工具: ${toolCall.name}, 参数: ${JSON.stringify(toolCall.arguments)}`)
 
         // 通过 Registry 路由并执行底层工具
         const result = await this.registry.execute(ctx, toolCall)
 
         if (result.isError) {
-          console.log(`  -> ❌ 工具执行报错: ${result.output}`)
+          log(`  -> ❌ 工具执行报错: ${result.output}`)
         } else {
-          console.log(`  -> ✅ 工具执行成功 (返回 ${result.output.length} 字节)`)
+          log(`  -> ✅ 工具执行成功 (返回 ${result.output.length} 字节)`)
         }
 
         // 将工具执行的观察结果追加到 Context，准备进入下一轮

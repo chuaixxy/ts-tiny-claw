@@ -1,3 +1,4 @@
+import { log, warn } from "../log/log.ts"
 import type { ToolCall, ToolDefinition, ToolResult } from "../schema/message.ts"
 
 /**
@@ -42,10 +43,10 @@ class RegistryImpl implements Registry {
   register(tool: BaseTool): void {
     const name = tool.name()
     if (this.tools.has(name)) {
-      console.warn(`[Warning] 工具 '${name}' 已经被注册，将被覆盖。`)
+      warn(`[Warning] 工具 '${name}' 已经被注册，将被覆盖。`)
     }
     this.tools.set(name, tool)
-    console.log(`[Registry] 成功挂载工具: ${name}`)
+    log(`[Registry] 成功挂载工具: ${name}`)
   }
 
   getAvailableTools(): ToolDefinition[] {
