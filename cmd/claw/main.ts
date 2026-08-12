@@ -1,10 +1,32 @@
-/* npx tsx cmd/claw/main.ts  */
+/* npx tsx cmd/claw/main.ts [cli|webhook|ws] [可选: 一次性 prompt] */
+// 对应 Go: cmd/claw/main.go（Go 原版只有飞书 HTTP Webhook 入口）
+//
+// Node 提供三种对话入口（互斥，由 argv / CLAW_MODE 选择）：
+//
+//   cli      终端 REPL —— 不依赖飞书 EventListener / Webhook / 长连接
+//            用法: npx tsx cmd/claw/main.ts
+//                  npx tsx cmd/claw/main.ts cli
+//                  npx tsx cmd/claw/main.ts cli "读取 a.txt 并总结"
+//
+//   webhook  飞书 HTTP 事件订阅（需公网 URL，对应 Go ListenAndServe）
+//            用法: npx tsx cmd/claw/main.ts webhook
+//
+//   ws       飞书长连接 —— 仍是应用机器人收消息，但不用 HTTP EventListener
+//            开放平台选「使用长连接接收事件」，本地无需公网入口
+//            用法: npx tsx cmd/claw/main.ts ws
 
 import { existsSync } from "node:fs"
+import http from "node:http"
 import path from "node:path"
+import * as readline from "node:readline/promises"
+import { stdin as input, stdout as output } from "node:process"
+
+import * as lark from "@larksuiteoapi/node-sdk"
 
 import { AgentEngine } from "../../internal/engine/loop.ts"
-import { error as logError } from "../../internal/log/log.ts"
+import type { Reporter } from "../../internal/engine/reporter.ts"
+import { createFeishuBot } from "../../internal/feishu/bot.ts"
+import { error as logError, log } from "../../internal/log/log.ts"
 import { createOpenAIProvider } from "../../internal/provider/openai.ts"
 // 也可换成 Claude 兼容端点：createClaudeProvider from "../../internal/provider/claude.ts"
 import { createBashTool } from "../../internal/tools/bash.ts"
@@ -22,7 +44,69 @@ function loadDotEnv(): void {
 
 loadDotEnv()
 
-async function main() {
+type RunMode = "cli" | "webhook" | "ws"
+
+function parseMode(argv: string[]): { mode: RunMode; oneShotPrompt?: string } {
+  // 优先 CLAW_MODE；否则看第一个参数；默认 cli（本地对话、不依赖飞书）
+  const envMode = process.env.CLAW_MODE?.trim().toLowerCase()
+  const arg0 = argv[0]?.toLowerCase()
+
+  const raw = envMode || arg0 || "cli"
+  if (raw === "webhook" || raw === "feishu" || raw === "http") {
+    return { mode: "webhook" }
+  }
+  if (raw === "ws" || raw === "websocket" || raw === "long-connection") {
+    return { mode: "ws" }
+  }
+  if (raw === "cli" || raw === "repl" || raw === "chat") {
+    // npx tsx cmd/claw/main.ts cli "一次性任务"
+    const oneShot =
+      argv[0] && ["cli", "repl", "chat"].includes(argv[0].toLowerCase())
+        ? argv.slice(1).join(" ").trim()
+        : argv.join(" ").trim()
+    return oneShot
+      ? { mode: "cli", oneShotPrompt: oneShot }
+      : { mode: "cli" }
+  }
+
+  // 未识别的首参：当作 cli 的一次性 prompt（方便 npx tsx cmd/claw/main.ts 帮我读 a.txt）
+  if (arg0 && !["webhook", "feishu", "http", "ws", "websocket", "long-connection"].includes(arg0)) {
+    return { mode: "cli", oneShotPrompt: argv.join(" ").trim() }
+  }
+
+  return { mode: "cli" }
+}
+
+/** 终端 Reporter：对齐飞书 FeishuReporter 的轻量气泡，避免和引擎 verbose 日志叠成两层 */
+function createCliReporter(): Reporter {
+  return {
+    onThinking: () => {
+      // 仅发一个轻量级提示，避免刷屏（同 FeishuReporter.OnThinking）
+      log("🤔 模型正在慢思考 (Thinking)...")
+    },
+    onToolCall: (_ctx, toolName, args) => {
+      log(`🛠️ **正在执行工具**：\`${toolName}\`\n参数：\`${args}\``)
+    },
+    onToolResult: (_ctx, toolName, result, isError) => {
+      if (isError) {
+        log(`⚠️ **执行报错** (${toolName})：\n${result}`)
+      } else {
+        // 成功时仅汇报成功，不刷全量日志（同 FeishuReporter）
+        log(`✅ **执行成功** (${toolName})`)
+      }
+    },
+    onMessage: (_ctx, content) => {
+      // 将模型最终的纯文本回答发给用户
+      log(`\n💬 ${content}\n`)
+    },
+  }
+}
+
+/** 1. 初始化引擎依赖（各入口共用） */
+function createEngine(): AgentEngine {
+  const workDir = process.cwd()
+
+  // 默认使用智谱 GLM-4（Go 检查 ZHIPU_API_KEY；本仓库统一用 OpenAI 兼容的 LLM_*）
   if (!process.env.LLM_API_KEY) {
     logError("请先设置 LLM_API_KEY 环境变量（可写在项目根目录 .env）")
     process.exit(1)
@@ -32,33 +116,144 @@ async function main() {
     process.exit(1)
   }
 
-  const workDir = process.cwd()
-
+  // 对应 Go: llmProvider := provider.NewZhipuOpenAIProvider("glm-4.5-air")
   const model = process.env.LLM_MODEL ?? "glm-4.5-air"
   const llmProvider = createOpenAIProvider(model)
 
   const registry = createRegistry()
   registry.register(createReadFileTool(workDir))
-  // 挂载其他的极简工具
   registry.register(createWriteFileTool(workDir))
   registry.register(createBashTool(workDir))
   registry.register(createEditFileTool(workDir))
 
-  // 实例化引擎，开启 EnableThinking = true (开启慢思考，促使模型一次性统筹规划)
-  const eng = new AgentEngine(llmProvider, registry, workDir, true)
+  // 开启慢思考
+  // 对应 Go: eng := engine.NewAgentEngine(llmProvider, registry, workDir, true)
+  return new AgentEngine(llmProvider, registry, workDir, true)
+}
 
-  // 下发一个需要收集多源信息的任务
-  const prompt = `
-    我当前目录下有 a.txt, b.txt, c.txt 三个文件。
-    为了节省时间，请你同时一次性读取这三个文件，并将它们的内容综合起来，告诉我它们分别记录了什么领域的信息。
-    `
+/**
+ * CLI 入口：不用飞书 EventListener，直接在终端和 Agent 对话。
+ * Reporter 打到 stdout；可一次性 prompt，也可 REPL 多轮（每轮独立 run）。
+ */
+async function runCli(
+  eng: AgentEngine,
+  oneShotPrompt?: string,
+): Promise<void> {
+  const reporter = createCliReporter()
 
+  if (oneShotPrompt) {
+    log(`[CLI] 一次性任务: ${oneShotPrompt}`)
+    await eng.run(undefined, oneShotPrompt, reporter)
+    return
+  }
+
+  log("🚀 ts-tiny-claw CLI 已启动（无需飞书事件订阅）")
+  log("   输入任务后回车；空行或 exit / quit 退出")
+  log("   其他入口: npx tsx cmd/claw/main.ts webhook | ws")
+  log("   调试引擎内部轨迹: CLAW_VERBOSE=1 npx tsx cmd/claw/main.ts")
+
+  const rl = readline.createInterface({ input, output })
   try {
-    await eng.run(undefined, prompt)
-  } catch (err) {
-    logError("引擎运行崩溃:", err)
-    process.exit(1)
+    while (true) {
+      const line = (await rl.question("\n你> ")).trim()
+      if (!line || line === "exit" || line === "quit") {
+        log("[CLI] 再见")
+        break
+      }
+      try {
+        await eng.run(undefined, line, reporter)
+      } catch (err) {
+        logError("[CLI] 引擎运行崩溃:", err)
+      }
+    }
+  } finally {
+    rl.close()
   }
 }
 
-await main()
+/**
+ * 飞书 HTTP Webhook 入口（对应 Go main）。
+ * 需要公网可达的请求地址；内网 IP（如 172.19.x.x）飞书云无法校验。
+ */
+async function runFeishuWebhook(eng: AgentEngine): Promise<void> {
+  // 2. 初始化飞书 Bot 调度器
+  // 对应 Go:
+  //   bot := feishu.NewFeishuBot(eng)
+  //   handler := httpserverext.NewEventHandlerFunc(bot.GetEventDispatcher())
+  const bot = createFeishuBot(eng)
+
+  // 3. 注册路由并启动 HTTP 服务
+  // 对应 Go: http.HandleFunc("/webhook/event", handler)
+  //
+  // 【飞书 URL 校验 / Challenge】：
+  // 填写请求地址并保存时，飞书 POST type=url_verification + challenge；
+  // 须在 1 秒内返回 {"challenge":"..."}。适配器需 autoChallenge: true。
+  // 若配置了 Encrypt Key，FEISHU_ENCRYPT_KEY 必须一致。
+  const port = Number(process.env.PORT ?? 48080)
+  const dispatcher = bot.getEventDispatcher()
+  const webhookHandler = lark.adaptDefault("/webhook/event", dispatcher, {
+    autoChallenge: true,
+  })
+
+  const server = http.createServer((req, res) => {
+    const pathname = (req.url ?? "").split("?")[0] ?? ""
+    if (pathname !== "/webhook/event") {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
+      res.end("not found")
+      return
+    }
+    req.url = "/webhook/event"
+    res.setHeader("Content-Type", "application/json; charset=utf-8")
+    // 打印入站，便于确认飞书云是否真的打到本机（内网 IP 通常打不到）
+    log(`[Feishu][Webhook] ${req.method} ${pathname} from ${req.socket.remoteAddress ?? "?"}`)
+    void webhookHandler(req, res)
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.listen(port, () => {
+      log(`🚀 ts-tiny-claw 飞书 Webhook 已启动，监听 :${port}`)
+      log(`   路径: http://localhost:${port}/webhook/event`)
+      log(`   注意: 请求地址必须是公网 IPv4；内网可用 ws 长连接入口`)
+      resolve()
+    })
+    server.on("error", (err) => {
+      logError("服务器启动失败:", err)
+      reject(err)
+    })
+  })
+}
+
+/**
+ * 飞书长连接入口：不用 HTTP EventListener / 不用公网 Webhook URL。
+ * 开放平台事件订阅方式选「使用长连接接收事件」。
+ */
+async function runFeishuLongConnection(eng: AgentEngine): Promise<void> {
+  const bot = createFeishuBot(eng)
+  log("🚀 ts-tiny-claw 飞书长连接模式启动中…")
+  log("   请在开放平台将订阅方式改为「使用长连接接收事件」")
+  await bot.startLongConnection()
+}
+
+async function main() {
+  const { mode, oneShotPrompt } = parseMode(process.argv.slice(2))
+  const eng = createEngine()
+
+  switch (mode) {
+    case "cli":
+      await runCli(eng, oneShotPrompt)
+      break
+    case "webhook":
+      await runFeishuWebhook(eng)
+      break
+    case "ws":
+      await runFeishuLongConnection(eng)
+      break
+  }
+}
+
+try {
+  await main()
+} catch (err) {
+  logError("启动失败:", err)
+  process.exit(1)
+}

@@ -2,6 +2,7 @@ import { log } from "../log/log.ts"
 import type { LLMProvider } from "../provider/provider.ts"
 import type { Message } from "../provider/schema.ts"
 import type { Registry } from "../tools/registry.ts"
+import type { Reporter } from "./reporter.ts"
 
 /** AgentEngine 是微型 OS 的核心驱动 */
 export class AgentEngine {
@@ -25,8 +26,15 @@ export class AgentEngine {
     this.enableThinking = enableThinking
   }
 
-  /** 启动 Agent 的生命周期 */
-  async run(ctx: AbortSignal | undefined, userPrompt: string): Promise<void> {
+  /**
+   * 启动 Agent 的生命周期。
+   * reporter 负责把思考 / 工具 / 最终回复推到 CLI、飞书等展现层。
+   */
+  async run(
+    ctx: AbortSignal | undefined,
+    userPrompt: string,
+    reporter: Reporter,
+  ): Promise<void> {
     log(`[Engine] 引擎启动，锁定工作区: ${this.workDir}`)
     log(`[Engine] 慢思考模式 (Thinking Phase): ${this.enableThinking}`)
 
@@ -60,6 +68,7 @@ export class AgentEngine {
       // ====================================================================
       if (this.enableThinking) {
         log("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
+        await reporter.onThinking(ctx)
 
         // 核心机制：传入的 availableTools 为 undefined / 空！
         // 大模型看不到任何 JSON Schema，被迫只能输出纯文本的思考过程。
@@ -92,6 +101,9 @@ export class AgentEngine {
       // ====================================================================
       if (!actionResp.toolCalls || actionResp.toolCalls.length === 0) {
         log("[Engine] 模型未请求调用工具，任务宣告完成。")
+        if (actionResp.content) {
+          await reporter.onMessage(ctx, actionResp.content)
+        }
         break
       }
 
@@ -111,7 +123,13 @@ export class AgentEngine {
       // Promise.all ≈ sync.WaitGroup.Wait()：并发跑完再继续
       await Promise.all(
         actionResp.toolCalls.map(async (toolCall, idx) => {
+          const args =
+            typeof toolCall.arguments === "string"
+              ? toolCall.arguments
+              : JSON.stringify(toolCall.arguments ?? {})
+
           log(`  -> [Go-${idx}] 🛠️ 触发并行执行: ${toolCall.name}`)
+          await reporter.onToolCall(ctx, toolCall.name, args)
 
           const result = await this.registry.execute(ctx, toolCall)
 
@@ -120,6 +138,8 @@ export class AgentEngine {
           } else {
             log(`  -> [Go-${idx}] ✅ 工具执行成功 (返回 ${result.output.length} 字节)`)
           }
+
+          await reporter.onToolResult(ctx, toolCall.name, result.output, result.isError)
 
           // 专属 idx 坑位写入（无锁、保序）
           observationMsgs[idx] = {
