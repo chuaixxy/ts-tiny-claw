@@ -11,7 +11,7 @@ npx tsx cmd/claw/main.ts [模式] [可选参数…]
 也可用环境变量选模式（优先级高于默认，可被命令行参数覆盖逻辑见下）：
 
 ```bash
-CLAW_MODE=cli|webhook|ws npx tsx cmd/claw/main.ts
+CLAW_MODE=cli|session|webhook|ws npx tsx cmd/claw/main.ts
 ```
 
 ---
@@ -23,14 +23,35 @@ CLAW_MODE=cli|webhook|ws npx tsx cmd/claw/main.ts
 | **cli**（默认） | `npx tsx cmd/claw/main.ts` | 否 | 一次性任务；`EnableThinking=true`；工作区 `workspace/`；无参数时跑演示 prompt（`ping.js` Node HTTP + git） |
 | **cli** 自定义 | `npx tsx cmd/claw/main.ts cli "任务…"` | 否 | 指定一次性 prompt |
 | **repl** | `npx tsx cmd/claw/main.ts repl` | 否 | 交互多轮 |
-| **webhook** | `npx tsx cmd/claw/main.ts webhook` | 要（HTTP 推事件） | 对齐 Go 飞书章节：监听 `/webhook/event` |
-| **ws** | `npx tsx cmd/claw/main.ts ws` | 要（长连接） | 不用公网 Webhook URL |
+| **session** | `npx tsx cmd/claw/main.ts session` | 否 | 本讲演示：并发 Session A（前端群）/ B（后端群）+ Working Memory(6) 截断 |
+| **webhook** | `npx tsx cmd/claw/main.ts webhook` | 要（HTTP 推事件） | 双工作区：私聊→`project_front`、群聊→`project_back`；`EnableThinking=false` |
+| **ws** | `npx tsx cmd/claw/main.ts ws` | 要（长连接） | 同上（真实流量版 Go 双 Session 并发测试）；私聊=场景1，群聊=场景2 |
 
 别名（等价）：
 
 - `webhook` ← `feishu` / `http`
 - `ws` ← `websocket` / `long-connection`
 - `cli` ← `repl` / `chat`
+- `session` ← `concurrent` / `memory`
+
+---
+
+## 0. Session 并发演示（本讲 Go main）
+
+对应 Go 本讲 `main.go`：同一无状态 `AgentEngine` 上并发跑两个 Session。
+
+```bash
+npx tsx cmd/claw/main.ts session
+# 或
+CLAW_MODE=session npx tsx cmd/claw/main.ts
+```
+
+| Session | 模拟 | 观察点 |
+|---------|------|--------|
+| **A** `chat_front_001` | 飞书前端群，`/Users/chrystal/test/project_front` | Turn1 读 README 密钥 → 灌 6 轮闲聊 → Turn2 追问密钥（应被 Working Memory=6 挤出） |
+| **B** `chat_back_002` | 飞书后端群，`/Users/chrystal/test/project_back`（错开 1s） | 问「别人查到的密钥你能看到吗」——应看不到 A 的历史 |
+
+`Promise.all` ≈ Go `WaitGroup`；引擎 `EnableThinking=false`，只挂 `read_file`。
 
 ---
 

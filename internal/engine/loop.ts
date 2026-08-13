@@ -1,86 +1,82 @@
 // internal/engine/loop.ts
 // 对应 Go: internal/engine/loop.go
 
-import {
-  createPromptComposer,
-  type PromptComposer,
-} from "../context/composer.ts"
+import { createPromptComposer } from "../context/composer.ts"
 import { log, verbose } from "../log/log.ts"
 import type { LLMProvider } from "../provider/provider.ts"
 import type { Message } from "../provider/schema.ts"
 import type { Registry } from "../tools/registry.ts"
 import type { Reporter } from "./reporter.ts"
+import type { Session } from "./session.ts"
+import { runWithWorkDir } from "./workdir-context.ts"
 
 /** AgentEngine 是微型 OS 的核心驱动 */
 export class AgentEngine {
   private provider: LLMProvider
   private registry: Registry
 
-  /** WorkDir (工作区): 借鉴 OpenClaw 的理念，Agent 必须有一个明确的物理边界 */
-  readonly workDir: string
   /** 慢思考模式开关 */
   readonly enableThinking: boolean
 
-  /** 【新增】引擎持有 Composer 实例 —— 动态组装 System Prompt */
-  private readonly composer: PromptComposer
-
+  // 【注意】：我们移除了 Engine 层级的 WorkDir，因为 WorkDir 现在应该跟随 Session 走！
   constructor(
     provider: LLMProvider,
     registry: Registry,
-    workDir: string,
     enableThinking: boolean,
   ) {
     this.provider = provider
     this.registry = registry
-    this.workDir = workDir
     this.enableThinking = enableThinking
-    // 对应 Go: composer: ctxpkg.NewPromptComposer(workDir)
-    this.composer = createPromptComposer(workDir)
   }
 
   /**
-   * 启动 Agent 的生命周期。
+   * 【核心改造】: 移除 userPrompt 参数，改为接收一个具体的 Session 实例。
    * reporter 负责把思考 / 工具 / 最终回复推到 CLI、飞书等展现层。
    * 引擎内部 Turn/Phase 轨迹默认不刷屏；设 CLAW_VERBOSE=1 可见。
    */
   async run(
     ctx: AbortSignal | undefined,
-    userPrompt: string,
+    session: Session,
     reporter: Reporter,
   ): Promise<void> {
-    // 对应 Go: log.Printf("[Engine] 引擎启动，锁定工作区: %s\n", e.WorkDir)
-    log(`[Engine] 引擎启动，锁定工作区: ${this.workDir}`)
+    // 工具 IO 跟随 Session.WorkDir（Engine 本身无状态、不绑目录）
+    return runWithWorkDir(session.workDir, () =>
+      this.runInSession(ctx, session, reporter),
+    )
+  }
+
+  private async runInSession(
+    ctx: AbortSignal | undefined,
+    session: Session,
+    reporter: Reporter,
+  ): Promise<void> {
+    // 对应 Go: log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", session.ID, session.WorkDir)
+    log(`[Engine] 唤醒会话 [${session.id}]，锁定工作区: ${session.workDir}`)
     verbose(`[Engine] 慢思考模式 (Thinking Phase): ${this.enableThinking}`)
 
-    // 【核心修改】动态组装 System Prompt，彻底替换掉以前硬编码的面条提示词！
-    // 对应 Go: systemMsg := e.composer.Build()
-    const systemMsg = this.composer.build()
-
-    // 注入动态组装的内核、AGENTS.md 与 Skills
-    const contextHistory: Message[] = [
-      systemMsg,
-      {
-        role: "user",
-        content: userPrompt,
-      },
-    ]
+    // 根据当前 Session 的工作区，动态组装最新的 System Prompt
+    // 对应 Go: composer := ctxpkg.NewPromptComposer(session.WorkDir)
+    const composer = createPromptComposer(session.workDir)
+    const systemMsg = composer.build()
 
     let turnCount = 0
 
-    // 2. The Main Loop: 心跳开始 (标准的 ReAct 循环)
-    // Main Loop 后续的 for 循环、Phase 1/2 思考与并发执行，与第 09 讲保持一致
+    // The Main Loop: 心跳开始 (标准的 ReAct 循环)
     while (true) {
       if (ctx?.aborted) break
 
       turnCount++
       verbose(`\n========== [Turn ${turnCount}] 开始 ==========`)
 
-      // 获取当前挂载的所有工具定义
       const availableTools = this.registry.getAvailableTools()
 
-      // ====================================================================
-      // Phase 1: 慢思考阶段 (Thinking) - 剥夺工具，强制规划
-      // ====================================================================
+      // 1. 【上下文组装】: System Prompt + 截取最近的 6 条消息作为 Working Memory
+      // 在实际业务中，由于工具返回结果可能很长，短期工作记忆往往设为 6-10 条足以维系连贯对话
+      const workingMemory = session.getWorkingMemory(6)
+
+      const contextHistory: Message[] = [systemMsg, ...workingMemory]
+
+      // 2. ================= Phase 1: Thinking =================
       if (this.enableThinking) {
         verbose("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
         await reporter.onThinking(ctx)
@@ -95,20 +91,18 @@ export class AgentEngine {
         )
         log("[Engine] LLM 慢思考返回")
 
-        // 如果模型输出了思考过程，我们将其作为 Assistant 消息追加到上下文中
         if (thinkResp.content) {
           verbose(`🧠 [内部思考 Trace]: ${thinkResp.content}`)
+          // 将思考过程持久化到 Session 中！
+          session.append(thinkResp)
+          // 把它追加到当前这一轮的临时上下文中，供 Action 阶段使用
           contextHistory.push(thinkResp)
         }
       }
 
-      // ====================================================================
-      // Phase 2: 行动阶段 (Action) - 恢复工具，顺着规划执行
-      // ====================================================================
+      // 3. ================= Phase 2: Action =================
       verbose("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
 
-      // 此时的 contextHistory 中已经包含了上一阶段模型自己的 Thinking Trace。
-      // 模型会顺着自己的逻辑，结合恢复的 availableTools 发起精准的工具调用。
       log("[Engine] 正在请求 LLM（行动阶段，挂载工具）…")
       const actionResp = await this.provider.generate(
         ctx,
@@ -117,21 +111,18 @@ export class AgentEngine {
       )
       log("[Engine] LLM 行动阶段返回")
 
+      // 将大模型的行动响应持久化到 Session 中
+      session.append(actionResp)
       contextHistory.push(actionResp)
 
       if (actionResp.content) {
-        // 中间回合的助手碎碎念只进 verbose；最终纯文本由 reporter.onMessage 展示
         verbose(`🤖 [对外回复]: ${actionResp.content}`)
+        await reporter.onMessage(ctx, actionResp.content)
       }
 
-      // ====================================================================
-      // 退出与执行逻辑
-      // ====================================================================
       if (!actionResp.toolCalls || actionResp.toolCalls.length === 0) {
+        // 如果没有工具调用，说明本次任务已完成，打破 ReAct 循环，挂起等待人类的下一条指令
         verbose("[Engine] 模型未请求调用工具，任务宣告完成。")
-        if (actionResp.content) {
-          await reporter.onMessage(ctx, actionResp.content)
-        }
         break
       }
 
@@ -139,7 +130,7 @@ export class AgentEngine {
         `[Engine] 模型请求并发调用 ${actionResp.toolCalls.length} 个工具...`,
       )
 
-      // 【核心改造】: 从串行 (Sequential) 演进为并行 (Parallel)
+      // 4. ================= 并发执行底层工具 =================
       //
       // 三个驾驭工程细节（对应 Go 的 Goroutine + WaitGroup 实践）：
       // 1) 并发安全 / 闭包陷阱：用 map(async (toolCall, idx) => ...) 传参，
@@ -147,7 +138,7 @@ export class AgentEngine {
       // 2) 无锁设计：预分配 observationMsgs，每个 Promise 只写自己的 idx 坑位，
       //    无需 Mutex；Node 虽是单线程事件循环，这套结构仍保证清晰与可预测。
       // 3) 上下文顺序对齐：模型返回 [ToolA, ToolB] 时期望 [ResultA, ResultB]；
-      //    全部完成后再按索引顺序 push，避免乱序追加造成阅读混乱。
+      //    全部完成后再按索引顺序 append，避免乱序追加造成阅读混乱。
       const observationMsgs: Message[] = new Array(actionResp.toolCalls.length)
 
       // Promise.all ≈ sync.WaitGroup.Wait()：并发跑完再继续
@@ -171,10 +162,14 @@ export class AgentEngine {
             )
           }
 
+          let displayOutput = result.output
+          if (displayOutput.length > 200) {
+            displayOutput = displayOutput.slice(0, 200) + "... (已截断)"
+          }
           await reporter.onToolResult(
             ctx,
             toolCall.name,
-            result.output,
+            displayOutput,
             result.isError,
           )
 
@@ -191,10 +186,9 @@ export class AgentEngine {
         "[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...",
       )
 
-      // 按原始 ToolCall 顺序一次性追加到上下文时间线
-      contextHistory.push(...observationMsgs)
-
-      // 循环回到开头，模型将带着这一批新的 Observation 继续它的下一轮思考...
+      // 将所有的工具执行结果（Observation）持久化到 Session 中，开启下一轮的复盘与推理
+      // 下一轮循环会通过 GetWorkingMemory 从 Session 重新组装上下文，无需再改本轮 contextHistory
+      session.append(...observationMsgs)
     }
   }
 }

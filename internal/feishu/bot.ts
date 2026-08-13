@@ -5,7 +5,9 @@ import * as lark from "@larksuiteoapi/node-sdk"
 import type { Client, EventDispatcher } from "@larksuiteoapi/node-sdk"
 
 import type { AgentEngine } from "../engine/loop.ts"
-import type { Reporter } from "../engine/reporter.ts"
+import { createMultiReporter, type Reporter } from "../engine/reporter.ts"
+import { globalSessionMgr } from "../engine/session.ts"
+import { createTerminalReporter } from "../engine/terminal-reporter.ts"
 import { error as logError, log } from "../log/log.ts"
 
 /** 飞书 im.message.receive_v1 事件的最小载荷（Node SDK 回调 data 形状） */
@@ -15,9 +17,19 @@ interface FeishuMessageEvent {
   }
   message: {
     chat_id: string
+    /** p2p=私聊；group / topic_group=群聊 */
+    chat_type?: string
     message_type?: string
     content: string
   }
+}
+
+/** 双工作区：对齐 Go 本讲 GetOrCreate(id, "/tmp/project_front|back") */
+export interface FeishuWorkDirs {
+  /** 模拟「飞书前端群」Session A —— 含演示密钥 README */
+  frontDir: string
+  /** 模拟「飞书后端群」Session B —— 故意无密钥，测隔离 */
+  backDir: string
 }
 
 /** FeishuBot 封装了飞书机器人的配置与核心业务流 */
@@ -27,8 +39,14 @@ export class FeishuBot {
   readonly appSecret: string
   /** 持有核心引擎引用 */
   private readonly engine: AgentEngine
+  /** 私聊 → front；群聊 → back（WorkDir 跟随 Session，不再挂在 Engine 上） */
+  private readonly workDirs: FeishuWorkDirs
 
-  constructor(engine: AgentEngine, opts?: { appId?: string; appSecret?: string }) {
+  constructor(
+    engine: AgentEngine,
+    workDirs: FeishuWorkDirs,
+    opts?: { appId?: string; appSecret?: string },
+  ) {
     const appId = opts?.appId ?? process.env.FEISHU_APP_ID ?? ""
     const appSecret = opts?.appSecret ?? process.env.FEISHU_APP_SECRET ?? ""
 
@@ -40,6 +58,7 @@ export class FeishuBot {
     this.appId = appId
     this.appSecret = appSecret
     this.engine = engine
+    this.workDirs = workDirs
 
     // 实例化飞书官方客户端
     this.client = new lark.Client({
@@ -92,7 +111,10 @@ export class FeishuBot {
           return
         }
 
-        log(`[Feishu] 收到会话 ${chatId} 消息: ${contentStr}`)
+        const chatType = event.message.chat_type ?? "p2p"
+        log(
+          `[Feishu] 收到会话 ${chatId} (${chatType}) 消息: ${contentStr}`,
+        )
 
         // 【驾驭并发】：收到消息后，绝不能阻塞 HTTP 回调。
         // 我们要为每个请求开启一个独立的任务跑 Agent！
@@ -106,7 +128,11 @@ export class FeishuBot {
         // void this.handleAgentRun(...) 会立刻返回，Webhook 回调不被阻塞；
         // 事件循环里可以同时挂着多个 engine.run Promise——三条消息 = 三个独立的
         // ReAct 循环 + 各自绑定 chatId 的 FeishuReporter，语义与 Go 的 go 一致。
-        void this.handleAgentRun(chatId, contentStr)
+        //
+        // ================= 模拟并发场景（对齐 Go main 双 Session）=================
+        // 私聊 p2p  → project_front（场景 1：前端群 Session A，可读密钥）
+        // 群聊 group → project_back（场景 2：后端群 Session B，测历史/文件隔离）
+        void this.handleAgentRun(chatId, chatType, contentStr)
 
         return undefined
       },
@@ -117,18 +143,55 @@ export class FeishuBot {
     })
   }
 
+  /**
+   * 按聊天类型锁定工作区（对应 Go: GetOrCreate(id, workDir)）。
+   * - 私聊 p2p：模拟「飞书前端群」→ frontDir
+   * - 群聊 group：模拟「飞书后端群」→ backDir
+   */
+  private resolveWorkDir(chatType: string): {
+    workDir: string
+    label: string
+  } {
+    const isGroup = chatType === "group" || chatType === "topic_group"
+    if (isGroup) {
+      // ================= 模拟并发场景 2：飞书后端群 =================
+      return { workDir: this.workDirs.backDir, label: "Session B / 后端群" }
+    }
+    // ================= 模拟并发场景 1：飞书前端群（本地用私聊代替）=================
+    return { workDir: this.workDirs.frontDir, label: "Session A / 前端群(私聊)" }
+  }
+
   /** handleAgentRun 是连接飞书与底层引擎的桥梁 */
-  private async handleAgentRun(chatId: string, prompt: string): Promise<void> {
-    // 为当前聊天窗口实例化一个专属的 Reporter
-    const reporter = new FeishuReporter(this.client, chatId)
+  private async handleAgentRun(
+    chatId: string,
+    chatType: string,
+    prompt: string,
+  ): Promise<void> {
+    // 飞书回帖 + 终端旁路：本地也能看到与 session 演示相同的 🤖 / 🛠️ 日志
+    const feishuReporter = new FeishuReporter(this.client, chatId)
+    const reporter = createMultiReporter(
+      createTerminalReporter(),
+      feishuReporter,
+    )
+
+    // 对应 Go:
+    //   sessionA := GlobalSessionMgr.GetOrCreate("chat_front_001", "/tmp/project_front")
+    //   sessionB := GlobalSessionMgr.GetOrCreate("chat_back_002", "/tmp/project_back")
+    const { workDir, label } = this.resolveWorkDir(chatType)
+    const session = globalSessionMgr.getOrCreate(chatId, workDir)
+    session.append({ role: "user", content: prompt })
+
+    // 对齐 session 演示的可读轨迹（终端可见；工具/回复由 TerminalReporter 旁路打印）
+    log(`\n>>> 🙋‍♂️ [${label}][${chatId}]: ${prompt}`)
+    log(`   chat_type=${chatType} → 锁定工作区: ${workDir}`)
 
     // 启动引擎！
     try {
-      await this.engine.run(undefined, prompt, reporter)
+      await this.engine.run(undefined, session, reporter)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       logError("[Feishu] Agent 运行崩溃:", err)
-      await reporter.sendMsg(`❌ Agent 运行崩溃: ${msg}`)
+      await feishuReporter.sendMsg(`❌ Agent 运行崩溃: ${msg}`)
     }
   }
 
@@ -168,8 +231,11 @@ export class FeishuBot {
 }
 
 /** 工厂：对应 Go 的 NewFeishuBot */
-export function createFeishuBot(engine: AgentEngine): FeishuBot {
-  return new FeishuBot(engine)
+export function createFeishuBot(
+  engine: AgentEngine,
+  workDirs: FeishuWorkDirs,
+): FeishuBot {
+  return new FeishuBot(engine, workDirs)
 }
 
 /**

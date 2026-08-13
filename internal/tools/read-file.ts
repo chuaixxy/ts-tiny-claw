@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 
+import { getActiveWorkDir } from "../engine/workdir-context.ts"
 import type { ToolDefinition } from "../schema/message.ts"
 import type { BaseTool } from "./registry.ts"
 
@@ -61,7 +62,8 @@ export class ReadFileTool implements BaseTool {
     }
 
     // 2. 拼接绝对路径 (注意：生产环境中需要做路径穿越检测防范，防止 ../../etc/passwd)
-    const fullPath = path.join(this.workDir, input.path)
+    // 活跃工作区跟随当前 Session（对应 Go: session.WorkDir）
+    const fullPath = path.join(getActiveWorkDir(this.workDir), input.path)
 
     // 3. 执行物理 IO 操作
     let content: Buffer

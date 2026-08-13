@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 
+import { getActiveWorkDir } from "../engine/workdir-context.ts"
 import type { ToolDefinition } from "../schema/message.ts"
 import type { BaseTool } from "./registry.ts"
 
@@ -65,7 +66,8 @@ export class WriteFileTool implements BaseTool {
     }
 
     // 【安全防线】：限制在 WorkDir 下执行，防止大模型修改系统级文件
-    const fullPath = path.join(this.workDir, input.path)
+    // 活跃工作区跟随当前 Session（对应 Go: session.WorkDir）
+    const fullPath = path.join(getActiveWorkDir(this.workDir), input.path)
 
     // 自动创建缺失的父级目录
     try {

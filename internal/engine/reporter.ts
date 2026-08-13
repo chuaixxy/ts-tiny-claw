@@ -26,3 +26,27 @@ export interface Reporter {
   /** 当模型宣告任务完成，向用户输出最终纯文本回答时调用 */
   onMessage(ctx: AbortSignal | undefined, content: string): void | Promise<void>
 }
+
+/**
+ * MultiReporter：把同一事件扇出到多个 Reporter。
+ * 典型用法：飞书长连接时同时挂 TerminalReporter，本地终端也能看到
+ * `🤖 Agent 回复` / `[🛠️ 调用工具]` 等与 session 演示一致的日志。
+ */
+export function createMultiReporter(...reporters: Reporter[]): Reporter {
+  return {
+    async onThinking(ctx) {
+      await Promise.all(reporters.map((r) => r.onThinking(ctx)))
+    },
+    async onToolCall(ctx, toolName, args) {
+      await Promise.all(reporters.map((r) => r.onToolCall(ctx, toolName, args)))
+    },
+    async onToolResult(ctx, toolName, result, isError) {
+      await Promise.all(
+        reporters.map((r) => r.onToolResult(ctx, toolName, result, isError)),
+      )
+    },
+    async onMessage(ctx, content) {
+      await Promise.all(reporters.map((r) => r.onMessage(ctx, content)))
+    },
+  }
+}
