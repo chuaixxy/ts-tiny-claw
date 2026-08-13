@@ -1,24 +1,18 @@
-/* npx tsx cmd/claw/main.ts [cli|session|webhook|ws] [可选: 一次性 prompt] */
+/* npx tsx cmd/claw/main.ts [session|cli|webhook|ws] [可选: 一次性 prompt] */
 // 对应 Go: cmd/claw/main.go
 //
 // Node 提供多种对话入口（互斥，由 argv / CLAW_MODE 选择）：
 //
-//   cli      终端一次性任务（默认 EnableThinking=true；无参数时跑 Go 演示 prompt）
+//   session  本讲默认：并发 Session A/B mock（对齐 Go main）+ Working Memory 截断
 //            用法: npx tsx cmd/claw/main.ts
-//                  npx tsx cmd/claw/main.ts cli "读取 a.txt 并总结"
-//   repl     终端交互 REPL
-//            用法: npx tsx cmd/claw/main.ts repl
+//                  npx tsx cmd/claw/main.ts session
 //
-//   session  本讲演示：并发 Session A/B（前端群 / 后端群）+ Working Memory 截断
-//            用法: npx tsx cmd/claw/main.ts session
-//            对应 Go 本讲 main.go 的整段并发模拟
+//   cli      终端一次性任务 / REPL
+//            用法: npx tsx cmd/claw/main.ts cli "读取 a.txt 并总结"
+//                  npx tsx cmd/claw/main.ts repl
 //
-//   webhook  飞书 HTTP 事件订阅（需公网 URL，对应 Go ListenAndServe）
-//            用法: npx tsx cmd/claw/main.ts webhook
-//
-//   ws       飞书长连接 —— 仍是应用机器人收消息，但不用 HTTP EventListener
-//            开放平台选「使用长连接接收事件」，本地无需公网入口
-//            用法: npx tsx cmd/claw/main.ts ws
+//   webhook  飞书 HTTP 事件订阅（需公网 URL）
+//   ws       飞书长连接（开放平台选「使用长连接接收事件」）
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs"
 import { setTimeout as delay } from "node:timers/promises"
@@ -73,11 +67,11 @@ function parseMode(argv: string[]): {
   oneShotPrompt?: string
   interactive?: boolean
 } {
-  // 优先 CLAW_MODE；否则看第一个参数；默认 cli（本地对话、不依赖飞书）
+  // 优先 CLAW_MODE；否则看第一个参数；无参默认跑本讲 session mock（对齐 Go main）
   const envMode = process.env.CLAW_MODE?.trim().toLowerCase()
   const arg0 = argv[0]?.toLowerCase()
 
-  const raw = envMode || arg0 || "cli"
+  const raw = envMode || arg0 || "session"
   if (raw === "webhook" || raw === "feishu" || raw === "http") {
     return { mode: "webhook" }
   }
@@ -323,18 +317,18 @@ async function runCli(
 }
 
 /**
- * 飞书 HTTP Webhook 入口（对应 Go main）。
+ * 飞书 HTTP Webhook 入口。
  * 需要公网可达的请求地址；内网 IP（如 172.19.x.x）飞书云无法校验。
  */
 async function runFeishuWebhook(
   eng: AgentEngine,
-  workDirs: { frontDir: string; backDir: string },
+  workDir: string,
 ): Promise<void> {
   // 2. 初始化飞书 Bot 调度器
   // 对应 Go:
   //   bot := feishu.NewFeishuBot(eng)
   //   handler := httpserverext.NewEventHandlerFunc(bot.GetEventDispatcher())
-  const bot = createFeishuBot(eng, workDirs)
+  const bot = createFeishuBot(eng, workDir)
 
   // 3. 注册路由并启动 HTTP 服务
   // 对应 Go: http.HandleFunc("/webhook/event", handler)
@@ -381,63 +375,45 @@ async function runFeishuWebhook(
  * 飞书长连接入口：不用 HTTP EventListener / 不用公网 Webhook URL。
  * 开放平台事件订阅方式选「使用长连接接收事件」。
  *
- * 对齐 Go 本讲 main 的双 Session 并发测试（真实流量版）：
- *
- * ================= 模拟并发场景 1：飞书前端群 =================
- *   本地用「私聊 p2p」代替 chat_front_001 → project_front（含密钥 README）
- *   可测：读密钥 → 灌闲聊挤掉 Working Memory → 再追问是否忘掉
- *
- * ================= 模拟并发场景 2：飞书后端群 =================
- *   「群聊 group」→ project_back（故意无密钥）
- *   可测：问「别人查到的密钥你能看到吗？」——历史与文件均应隔离
- *
- * 同一无状态 AgentEngine；void handleAgentRun ≈ go func（可并发）。
+ * 本讲双 Session 并发 / Working Memory 截断测试见下方 mock（对齐 Go main），
+ * 不要在飞书路径里再做「工具跟 Session.WorkDir 走」——讲义未实现。
  */
 async function runFeishuLongConnection(
   eng: AgentEngine,
-  workDirs: { frontDir: string; backDir: string },
+  workDir: string,
 ): Promise<void> {
-  const bot = createFeishuBot(eng, workDirs)
+  const bot = createFeishuBot(eng, workDir)
   log("🚀 ts-tiny-claw 飞书长连接模式启动中…")
   log("   请在开放平台将订阅方式改为「使用长连接接收事件」")
-  log("   并发测试映射（对齐 Go GetOrCreate）：")
-  log(`   · 私聊 p2p  → Session A / 前端群 → ${workDirs.frontDir}`)
-  log(`   · 群聊 group → Session B / 后端群 → ${workDirs.backDir}`)
   await bot.startLongConnection()
 }
 
 async function main() {
   const { mode, oneShotPrompt, interactive } = parseMode(process.argv.slice(2))
 
-  // 本讲 Go main 的整段并发演示（独立装配引擎，不走 workspace/ 全工具集）
+  // 对应 Go 本讲 main.go：默认 / session 模式跑双 Session mock
+  // ================= 模拟并发场景 1：飞书前端群 =================
+  // ================= 模拟并发场景 2：飞书后端群 =================
+  // （实现见 runConcurrentSessionDemo；讲义不实现工具跟随 Session.WorkDir）
   if (mode === "session") {
     await runConcurrentSessionDemo()
     return
   }
 
-  const isFeishu = mode === "ws" || mode === "webhook"
-
-  // 飞书：双工作区 + 关闭慢思考（对齐 Go eng := NewAgentEngine(..., false)）
-  // CLI：仓库内 workspace/
-  if (isFeishu) {
-    const workDirs = ensureSessionDemoProjects()
-    // 工具构造 fallback 用 frontDir；真正 IO 在 Run 时跟随 Session.WorkDir
-    const eng = createEngine(workDirs.frontDir, /* enableThinking */ false)
-    log(`[Feishu] EnableThinking=false；双工作区已就绪`)
-    log(`   front(私聊/场景1)=${workDirs.frontDir}`)
-    log(`   back (群聊/场景2)=${workDirs.backDir}`)
-
-    if (mode === "webhook") {
-      await runFeishuWebhook(eng, workDirs)
-    } else {
-      await runFeishuLongConnection(eng, workDirs)
-    }
-    return
-  }
-
   const workDir = ensureWorkDir()
   const eng = createEngine(workDir, true)
-  await runCli(eng, workDir, oneShotPrompt, interactive === true)
+
+  switch (mode) {
+    case "cli":
+      await runCli(eng, workDir, oneShotPrompt, interactive === true)
+      break
+    case "webhook":
+      await runFeishuWebhook(eng, workDir)
+      break
+    case "ws":
+      await runFeishuLongConnection(eng, workDir)
+      break
+  }
 }
 
 try {

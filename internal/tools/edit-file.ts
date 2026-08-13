@@ -1,7 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 
-import { getActiveWorkDir } from "../engine/workdir-context.ts"
 import type { ToolDefinition } from "../schema/message.ts"
 import type { BaseTool } from "./registry.ts"
 
@@ -171,8 +170,7 @@ export class EditFileTool implements BaseTool {
       )
     }
 
-    // 活跃工作区跟随当前 Session（对应 Go: session.WorkDir）
-    const fullPath = path.join(getActiveWorkDir(this.workDir), input.path)
+    const fullPath = path.join(this.workDir, input.path)
 
     // 1. 读取原文件内容
     let originalContent: string

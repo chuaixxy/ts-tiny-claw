@@ -11,7 +11,7 @@ npx tsx cmd/claw/main.ts [模式] [可选参数…]
 也可用环境变量选模式（优先级高于默认，可被命令行参数覆盖逻辑见下）：
 
 ```bash
-CLAW_MODE=cli|session|webhook|ws npx tsx cmd/claw/main.ts
+CLAW_MODE=session|cli|webhook|ws npx tsx cmd/claw/main.ts
 ```
 
 ---
@@ -20,12 +20,11 @@ CLAW_MODE=cli|session|webhook|ws npx tsx cmd/claw/main.ts
 
 | 模式 | 命令 | 要不要飞书 | 说明 |
 |------|------|------------|------|
-| **cli**（默认） | `npx tsx cmd/claw/main.ts` | 否 | 一次性任务；`EnableThinking=true`；工作区 `workspace/`；无参数时跑演示 prompt（`ping.js` Node HTTP + git） |
-| **cli** 自定义 | `npx tsx cmd/claw/main.ts cli "任务…"` | 否 | 指定一次性 prompt |
+| **session**（默认） | `npx tsx cmd/claw/main.ts` 或 `… session` | 否 | 本讲 Go main mock：并发 Session A/B + Working Memory(6) 截断 |
+| **cli** 自定义 | `npx tsx cmd/claw/main.ts cli "任务…"` | 否 | 指定一次性 prompt；工作区 `workspace/` |
 | **repl** | `npx tsx cmd/claw/main.ts repl` | 否 | 交互多轮 |
-| **session** | `npx tsx cmd/claw/main.ts session` | 否 | 本讲演示：并发 Session A（前端群）/ B（后端群）+ Working Memory(6) 截断 |
-| **webhook** | `npx tsx cmd/claw/main.ts webhook` | 要（HTTP 推事件） | 双工作区：私聊→`project_front`、群聊→`project_back`；`EnableThinking=false` |
-| **ws** | `npx tsx cmd/claw/main.ts ws` | 要（长连接） | 同上（真实流量版 Go 双 Session 并发测试）；私聊=场景1，群聊=场景2 |
+| **webhook** | `npx tsx cmd/claw/main.ts webhook` | 要（HTTP 推事件） | 飞书 HTTP；按 chatId 隔离 Session 历史 |
+| **ws** | `npx tsx cmd/claw/main.ts ws` | 要（长连接） | 飞书长连接；同上 |
 
 别名（等价）：
 
@@ -36,40 +35,39 @@ CLAW_MODE=cli|session|webhook|ws npx tsx cmd/claw/main.ts
 
 ---
 
-## 0. Session 并发演示（本讲 Go main）
+## 0. Session 并发演示（本讲 Go main，默认入口）
 
-对应 Go 本讲 `main.go`：同一无状态 `AgentEngine` 上并发跑两个 Session。
+对应 Go 本讲 `main.go`：同一无状态 `AgentEngine` 上并发跑两个 Session。  
+讲义不实现「工具跟随 Session.WorkDir」；Session B 靠「不准调用工具」测历史隔离。
 
 ```bash
+npx tsx cmd/claw/main.ts
 npx tsx cmd/claw/main.ts session
-# 或
-CLAW_MODE=session npx tsx cmd/claw/main.ts
 ```
 
 | Session | 模拟 | 观察点 |
 |---------|------|--------|
-| **A** `chat_front_001` | 飞书前端群，`/Users/chrystal/test/project_front` | Turn1 读 README 密钥 → 灌 6 轮闲聊 → Turn2 追问密钥（应被 Working Memory=6 挤出） |
-| **B** `chat_back_002` | 飞书后端群，`/Users/chrystal/test/project_back`（错开 1s） | 问「别人查到的密钥你能看到吗」——应看不到 A 的历史 |
+| **A** `chat_front_001` | 飞书前端群，`project_front` | Turn1 读 README 密钥 → 灌 6 轮闲聊 → Turn2 追问密钥（应被 Working Memory=6 挤出） |
+| **B** `chat_back_002` | 飞书后端群，`project_back`（错开 1s） | 问「别人查到的密钥你能看到吗」——应看不到 A 的历史 |
 
 `Promise.all` ≈ Go `WaitGroup`；引擎 `EnableThinking=false`，只挂 `read_file`。
 
 ---
 
-## 1. CLI（本地对话，推荐先跑通）
+## 1. CLI（本地对话）
 
-不经过飞书 EventListener / Webhook / 长连接。进度与最终回答由终端 `Reporter` 打印（默认安静；引擎 Turn/Phase 细节需开 verbose）。
+不经过飞书 EventListener / Webhook / 长连接。进度与最终回答由终端 `Reporter` 打印。
 
 ```bash
 # 交互式：多轮输入，空行或 exit / quit 退出
-npx tsx cmd/claw/main.ts
-npx tsx cmd/claw/main.ts cli
+npx tsx cmd/claw/main.ts repl
 
 # 一次性任务
 npx tsx cmd/claw/main.ts cli "读取 a.txt、b.txt、c.txt 并总结"
 npx tsx cmd/claw/main.ts "帮我查下本机 IP"   # 首参不是模式名时，整段当作一次性 prompt
 
 # 查看引擎内部轨迹（Turn / Phase / 思考全文等）
-CLAW_VERBOSE=1 npx tsx cmd/claw/main.ts
+CLAW_VERBOSE=1 npx tsx cmd/claw/main.ts cli "…"
 ```
 
 **依赖环境变量：** `LLM_API_KEY`、`LLM_BASE_URL`（可选 `LLM_MODEL`，默认 `glm-4.5-air`）。

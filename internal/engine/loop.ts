@@ -8,7 +8,6 @@ import type { Message } from "../provider/schema.ts"
 import type { Registry } from "../tools/registry.ts"
 import type { Reporter } from "./reporter.ts"
 import type { Session } from "./session.ts"
-import { runWithWorkDir } from "./workdir-context.ts"
 
 /** AgentEngine 是微型 OS 的核心驱动 */
 export class AgentEngine {
@@ -33,19 +32,11 @@ export class AgentEngine {
    * 【核心改造】: 移除 userPrompt 参数，改为接收一个具体的 Session 实例。
    * reporter 负责把思考 / 工具 / 最终回复推到 CLI、飞书等展现层。
    * 引擎内部 Turn/Phase 轨迹默认不刷屏；设 CLAW_VERBOSE=1 可见。
+   *
+   * 讲义同款：工具 Registry 仍在构造时绑定固定 WorkDir；Session.WorkDir 主要用于
+   * PromptComposer。双目录文件隔离靠 main 里 mock（Session B 不准调工具）。
    */
   async run(
-    ctx: AbortSignal | undefined,
-    session: Session,
-    reporter: Reporter,
-  ): Promise<void> {
-    // 工具 IO 跟随 Session.WorkDir（Engine 本身无状态、不绑目录）
-    return runWithWorkDir(session.workDir, () =>
-      this.runInSession(ctx, session, reporter),
-    )
-  }
-
-  private async runInSession(
     ctx: AbortSignal | undefined,
     session: Session,
     reporter: Reporter,

@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 
-import { getActiveWorkDir } from "../engine/workdir-context.ts"
 import type { ToolDefinition } from "../schema/message.ts"
 import type { BaseTool } from "./registry.ts"
 
@@ -73,7 +72,7 @@ export class BashTool implements BaseTool {
     try {
       //  在 macOS/Linux 下，我们通过将指令包裹在 `bash -c` 中执行，以支持环境变量、管道和逻辑与(&&)等复杂 Shell 语法。
       const { stdout, stderr } = await execFileAsync("bash", ["-c", input.command], {
-        cwd: getActiveWorkDir(this.workDir),
+        cwd: this.workDir,
         timeout: EXEC_TIMEOUT_MS,
         signal: ctx,
         encoding: "utf8",
