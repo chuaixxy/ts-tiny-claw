@@ -6,9 +6,10 @@ import type { Client, EventDispatcher } from "@larksuiteoapi/node-sdk"
 
 import type { AgentEngine } from "../engine/loop.ts"
 import { createMultiReporter, type Reporter } from "../engine/reporter.ts"
-import { globalSessionMgr } from "../engine/session.ts"
+import type { Session } from "../engine/session.ts"
 import { createTerminalReporter } from "../engine/terminal-reporter.ts"
 import { error as logError, log } from "../log/log.ts"
+import { globalApprovalMgr } from "./approval.ts"
 
 /** 飞书 im.message.receive_v1 事件的最小载荷（Node SDK 回调 data 形状） */
 interface FeishuMessageEvent {
@@ -29,12 +30,14 @@ export class FeishuBot {
   readonly appSecret: string
   /** 持有核心引擎引用 */
   private readonly engine: AgentEngine
-  /** Session 默认工作区（讲义同款：工具仍绑定 Registry 构造时的目录） */
-  private readonly workDir: string
+  /** 绑定的 Session（对应第 11 讲：对话历史随 Session 走） */
+  private readonly sess: Session
+  /** 最近一次 Agent 运行绑定的 FeishuReporter（供审批 Middleware 发通知） */
+  private r: FeishuReporter | null = null
 
   constructor(
     engine: AgentEngine,
-    workDir: string,
+    sess: Session,
     opts?: { appId?: string; appSecret?: string },
   ) {
     const appId = opts?.appId ?? process.env.FEISHU_APP_ID ?? ""
@@ -48,7 +51,7 @@ export class FeishuBot {
     this.appId = appId
     this.appSecret = appSecret
     this.engine = engine
-    this.workDir = workDir
+    this.sess = sess // 绑定 session 信息
 
     // 实例化飞书官方客户端
     this.client = new lark.Client({
@@ -57,6 +60,11 @@ export class FeishuBot {
       appType: lark.AppType.SelfBuild,
       domain: lark.Domain.Feishu,
     })
+  }
+
+  /** 新增：返回 FeishuBot 绑定的 Reporter */
+  reporter(): FeishuReporter | null {
+    return this.r
   }
 
   /**
@@ -103,18 +111,35 @@ export class FeishuBot {
 
         log(`[Feishu] 收到会话 ${chatId} 消息: ${contentStr}`)
 
+        // 【新增】：拦截人工审批的特殊口令
+        if (contentStr.startsWith("approve ")) {
+          const taskID = contentStr.slice("approve ".length).trim()
+          // 唤醒挂起的引擎异步调用！
+          globalApprovalMgr.resolveApproval(
+            taskID,
+            true,
+            "人类管理员已批准操作",
+          )
+          log(`[Feishu] 会话 ${chatId}: ✅ 已为您批准任务 ${taskID}`)
+          return undefined
+        }
+        if (contentStr.startsWith("reject ")) {
+          const taskID = contentStr.slice("reject ".length).trim()
+          // 唤醒挂起的引擎异步调用，并反馈拒绝理由！
+          globalApprovalMgr.resolveApproval(
+            taskID,
+            false,
+            "人类管理员认为该操作存在极高风险，已无情拒绝",
+          )
+          log(`[Feishu] 会话 ${chatId}: 🚫 已拒绝任务 ${taskID}`)
+          return undefined
+        }
+
+        // 如果不是审批命令，则是正常对话，启动一个新的 Agent 任务去处理
+        //
         // 【驾驭并发】：收到消息后，绝不能阻塞 HTTP 回调。
-        // 我们要为每个请求开启一个独立的任务跑 Agent！
-        //
-        // Go 使用 go 关键字拉起 Goroutine：
-        //   go b.handleAgentRun(chatId, contentStr)
-        // 当你在飞书群里同时发了三条指令，服务器瞬间会拉起三个完全独立的
-        // ReAct 循环，它们各自思考，各干各的，最后各自回传给对应的飞书聊天窗口。
-        //
-        // Node 没有 go 协程，等价写法是：不 await 这个 async 方法（fire-and-forget）。
-        // void this.handleAgentRun(...) 会立刻返回，Webhook 回调不被阻塞；
-        // 事件循环里可以同时挂着多个 engine.run Promise——三条消息 = 三个独立的
-        // ReAct 循环 + 各自绑定 chatId 的 FeishuReporter，语义与 Go 的 go 一致。
+        // Go: go b.handleAgentRun(chatId, contentStr)
+        // Node: void this.handleAgentRun(...) fire-and-forget
         void this.handleAgentRun(chatId, contentStr)
 
         return undefined
@@ -128,22 +153,24 @@ export class FeishuBot {
 
   /** handleAgentRun 是连接飞书与底层引擎的桥梁 */
   private async handleAgentRun(chatId: string, prompt: string): Promise<void> {
-    // 飞书回帖 + 终端旁路：本地也能看到 🤖 / 🛠️ 日志
     const feishuReporter = new FeishuReporter(this.client, chatId)
+    // 对应 Go: b.r = reporter —— 供审批 Middleware 通过 bot.Reporter() 取到发信通道
+    this.r = feishuReporter
+
+    // 飞书回帖 + 终端旁路：本地也能看到 🤖 / 🛠️ 日志
     const reporter = createMultiReporter(
       createTerminalReporter(),
       feishuReporter,
     )
 
-    // 按 chatId 隔离 Session（历史物理隔离；WorkDir 与 Registry 工具目录一致即可）
-    const session = globalSessionMgr.getOrCreate(chatId, this.workDir)
-    session.append({ role: "user", content: prompt })
+    // 将 prompt 加入绑定的 Session（对应第 11 讲）
+    this.sess.append({ role: "user", content: prompt })
 
-    log(`\n>>> 🙋‍♂️ [Session ${chatId}]: ${prompt}`)
+    log(`\n>>> 🙋‍♂️ [Session ${this.sess.id} / chat ${chatId}]: ${prompt}`)
 
     // 启动引擎！
     try {
-      await this.engine.run(undefined, session, reporter)
+      await this.engine.run(undefined, this.sess, reporter)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       logError("[Feishu] Agent 运行崩溃:", err)
@@ -186,12 +213,12 @@ export class FeishuBot {
   }
 }
 
-/** 工厂：对应 Go 的 NewFeishuBot */
+/** 工厂：对应 Go 的 NewFeishuBot(eng, sess) */
 export function createFeishuBot(
   engine: AgentEngine,
-  workDir: string,
+  sess: Session,
 ): FeishuBot {
-  return new FeishuBot(engine, workDir)
+  return new FeishuBot(engine, sess)
 }
 
 /**

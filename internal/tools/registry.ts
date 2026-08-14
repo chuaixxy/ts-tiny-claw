@@ -1,3 +1,6 @@
+// internal/tools/registry.ts
+// 对应 Go: internal/tools/registry.go
+
 import { log, warn } from "../log/log.ts"
 import type { ToolCall, ToolDefinition, ToolResult } from "../schema/message.ts"
 
@@ -21,10 +24,25 @@ export interface BaseTool {
   execute(ctx: AbortSignal | undefined, args: Uint8Array): Promise<string>
 }
 
+/**
+ * MiddlewareFunc 定义了中间件的签名。
+ * 它接收当前的 ToolCall，并返回是否允许执行 (allowed)，以及拦截时的原因 (rejectReason)。
+ * Node 侧允许返回 Promise，以便 WaitForApproval 异步挂起（对应 Go 里 channel 阻塞）。
+ */
+export type MiddlewareFunc = (
+  ctx: AbortSignal | undefined,
+  call: ToolCall,
+) =>
+  | { allowed: boolean; rejectReason: string }
+  | Promise<{ allowed: boolean; rejectReason: string }>
+
 /** Registry 定义了工具的注册与分发接口 */
 export interface Registry {
   /** 挂载一个新的工具到系统中 */
   register(tool: BaseTool): void
+
+  /** 【新增】全局 Middleware 挂载点 */
+  use(mw: MiddlewareFunc): void
 
   /** 返回当前系统挂载的所有工具的 Schema，供 Main Loop 交给 Provider */
   getAvailableTools(): ToolDefinition[]
@@ -39,6 +57,8 @@ export interface Registry {
 /** Registry 接口的默认实现：以工具 Name 为 Key 做 O(1) 路由 */
 class RegistryImpl implements Registry {
   private readonly tools = new Map<string, BaseTool>()
+  /** 【新增】保存挂载的中间件链 */
+  private readonly middlewares: MiddlewareFunc[] = []
 
   register(tool: BaseTool): void {
     const name = tool.name()
@@ -47,6 +67,10 @@ class RegistryImpl implements Registry {
     }
     this.tools.set(name, tool)
     log(`[Registry] 成功挂载工具: ${name}`)
+  }
+
+  use(mw: MiddlewareFunc): void {
+    this.middlewares.push(mw)
   }
 
   getAvailableTools(): ToolDefinition[] {
@@ -64,7 +88,20 @@ class RegistryImpl implements Registry {
       }
     }
 
-    // 2. 执行工具逻辑：将原始的 JSON 字节流直接丢给具体工具
+    // 2. 【核心防御】在执行底层逻辑前，依次运行所有的 Middleware
+    for (const mw of this.middlewares) {
+      const { allowed, rejectReason } = await mw(ctx, call)
+      if (!allowed) {
+        log(`[Registry] ⚠️ 工具 ${call.name} 被 Middleware 拦截: ${rejectReason}`)
+        return {
+          toolCallId: call.id,
+          output: `执行被系统拦截。原因: ${rejectReason}`,
+          isError: true, // 必须返回 Error，强制大模型阅读拒绝理由
+        }
+      }
+    }
+
+    // 3. 执行工具逻辑 (如果所有 Middleware 都放行了)
     try {
       const output = await tool.execute(ctx, toRawJSON(call.arguments))
       return {
@@ -73,7 +110,6 @@ class RegistryImpl implements Registry {
         isError: false,
       }
     } catch (err) {
-      // 3. 封装底层物理错误后返回给 Main Loop
       return {
         toolCallId: call.id,
         output: `Error executing ${call.name}: ${err instanceof Error ? err.message : String(err)}`,

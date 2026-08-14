@@ -1,14 +1,15 @@
 /* npx tsx cmd/claw/main.ts */
 // 对应 Go: cmd/claw/main.go
 //
-// 本讲默认：关闭 PlanMode，跑死循环干预演示（反复 read_file 不存在的 secret_key.txt）。
+// 本讲默认：飞书 Webhook + 高危命令人工审批 Middleware。
 //            用法: npx tsx cmd/claw/main.ts
+//                  npx tsx cmd/claw/main.ts webhook
 //
 // 其它入口（互斥，由 argv / CLAW_MODE 选择）：
 //   -prompt  自定义一次性任务（本讲同样关闭 PlanMode）
+//   doom     死循环干预演示
 //   session  并发 Session A/B mock + Working Memory 截断
 //   repl     终端交互 REPL
-//   webhook  飞书 HTTP 事件订阅（需公网 URL）
 //   ws       飞书长连接（开放平台选「使用长连接接收事件」）
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs"
@@ -24,13 +25,20 @@ import { AgentEngine } from "../../internal/engine/loop.ts"
 import { globalSessionMgr } from "../../internal/engine/session.ts"
 import { createTerminalReporter } from "../../internal/engine/terminal-reporter.ts"
 import { createFeishuBot } from "../../internal/feishu/bot.ts"
+import {
+  globalApprovalMgr,
+  isDangerousCommand,
+} from "../../internal/feishu/approval.ts"
 import { error as logError, log } from "../../internal/log/log.ts"
 import { createOpenAIProvider } from "../../internal/provider/openai.ts"
 // 也可换成 Claude 兼容端点：createClaudeProvider from "../../internal/provider/claude.ts"
 import { createBashTool } from "../../internal/tools/bash.ts"
 import { createEditFileTool } from "../../internal/tools/edit-file.ts"
 import { createReadFileTool } from "../../internal/tools/read-file.ts"
-import { createRegistry } from "../../internal/tools/registry.ts"
+import {
+  createRegistry,
+  type Registry,
+} from "../../internal/tools/registry.ts"
 import { createWriteFileTool } from "../../internal/tools/write-file.ts"
 
 /** Node 不会自动读 .env，启动时从工作区根目录加载 */
@@ -64,7 +72,7 @@ const MODE_ALIASES = new Set([
 /**
  * 对应 Go: flag.String("prompt", "", ...) + flag.Parse()
  * 同时兼容 --prompt / -prompt，以及历史入口模式名。
- * 本讲无参默认走 doom loop 死循环干预演示。
+ * 本讲无参默认走飞书 Webhook + 人工审批拦截。
  */
 function parseArgs(argv: string[]): {
   mode: RunMode
@@ -116,8 +124,8 @@ function parseArgs(argv: string[]): {
     return { mode: "prompt", prompt: rest.join(" ").trim() }
   }
 
-  // 对应 Go 本讲默认：无参启动死循环干预测试
-  return { mode: "doom", prompt }
+  // 对应 Go 本讲默认：启动飞书服务端 + 审批 Middleware
+  return { mode: "webhook", prompt }
 }
 
 /** 确保工作区目录存在（WorkDir 跟随 Session，不再挂在 Engine 上） */
@@ -135,12 +143,13 @@ function ensureWorkDir(): string {
 /**
  * 初始化引擎依赖。
  * 对应 Go: NewAgentEngine(llmProvider, registry, enableThinking, planMode)
+ * 返回 registry，便于在 bot 创建后挂载审批 Middleware。
  */
 function createEngine(
   workDir: string,
   enableThinking = false,
   planMode = false,
-): AgentEngine {
+): { eng: AgentEngine; registry: Registry } {
   // 默认使用智谱 GLM-4（Go 检查 ZHIPU_API_KEY；本仓库统一用 OpenAI 兼容的 LLM_*）
   if (!process.env.LLM_API_KEY) {
     logError("请先设置 LLM_API_KEY 环境变量（可写在项目根目录 .env）")
@@ -163,8 +172,9 @@ function createEngine(
   registry.register(createEditFileTool(workDir))
 
   // 实例化引擎；【注意】WorkDir 已从 Engine 移除，跟随 Session 走
-  // 本讲默认：EnableThinking=false，PlanMode=false（关闭计划模式，专注死循环干预）
-  return new AgentEngine(llmProvider, registry, enableThinking, planMode)
+  // 本讲默认：EnableThinking=false，PlanMode=false
+  const eng = new AgentEngine(llmProvider, registry, enableThinking, planMode)
+  return { eng, registry }
 }
 
 /** 本讲演示用的前后端工作区（对应 Go: /tmp/project_front|back） */
@@ -286,7 +296,7 @@ const DOOM_LOOP_PROMPT = `
 async function runDoomLoopDemo(workDir: string): Promise<void> {
   // 关闭 Plan 模式，让它在死胡同里专注地展示挣扎过程
   // 对应 Go: eng := engine.NewAgentEngine(llmProvider, registry, false, false)
-  const eng = createEngine(workDir, false, false)
+  const { eng } = createEngine(workDir, false, false)
   const reporter = createTerminalReporter()
 
   const sessionID = "test_doom_loop_001"
@@ -357,18 +367,51 @@ async function runRepl(eng: AgentEngine, workDir: string): Promise<void> {
 }
 
 /**
- * 飞书 HTTP Webhook 入口。
- * 需要公网可达的请求地址；内网 IP（如 172.19.x.x）飞书云无法校验。
+ * 飞书 HTTP Webhook 入口（本讲默认）。
+ * 对应 Go main：绑定 Session + 注册高危命令审批 Middleware + 启动 :48080。
  */
 async function runFeishuWebhook(
   eng: AgentEngine,
+  registry: Registry,
   workDir: string,
 ): Promise<void> {
-  // 2. 初始化飞书 Bot 调度器
-  // 对应 Go:
-  //   bot := feishu.NewFeishuBot(eng)
-  //   handler := httpserverext.NewEventHandlerFunc(bot.GetEventDispatcher())
-  const bot = createFeishuBot(eng, workDir)
+  // 假设一个 bot 绑定一个 session
+  // 对应 Go: sessionID := "test_command_intercept_001"
+  const sessionID = "test_command_intercept_001"
+  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
+  sess.append({ role: "user", content: "" })
+
+  // 对应 Go: bot := feishu.NewFeishuBot(eng, sess)
+  const bot = createFeishuBot(eng, sess)
+
+  // 【核心注入】注册安全拦截 Middleware
+  registry.use(async (_ctx, call) => {
+    const argsStr =
+      typeof call.arguments === "string"
+        ? call.arguments
+        : JSON.stringify(call.arguments ?? {})
+
+    // 检查是否命中高危特征库
+    if (isDangerousCommand(call.name, argsStr)) {
+      const taskID = call.id // 使用大模型生成的唯一 ToolCallID 作为 TaskID
+
+      // 挂起当前异步调用，发送消息给飞书，等待人类的审批！
+      const { allowed, reason } = await globalApprovalMgr.waitForApproval(
+        taskID,
+        call.name,
+        argsStr,
+        bot.reporter(),
+      )
+
+      if (!allowed) {
+        return { allowed: false, rejectReason: reason } // 拒绝，将理由传回给大模型
+      }
+      return { allowed: true, rejectReason: "" } // 同意，放行底层工具
+    }
+
+    // 没命中黑名单，直接 YOLO 放行
+    return { allowed: true, rejectReason: "" }
+  })
 
   // 3. 注册路由并启动 HTTP 服务
   // 对应 Go: http.HandleFunc("/webhook/event", handler)
@@ -393,13 +436,15 @@ async function runFeishuWebhook(
     req.url = "/webhook/event"
     res.setHeader("Content-Type", "application/json; charset=utf-8")
     // 打印入站，便于确认飞书云是否真的打到本机（内网 IP 通常打不到）
-    log(`[Feishu][Webhook] ${req.method} ${pathname} from ${req.socket.remoteAddress ?? "?"}`)
+    log(
+      `[Feishu][Webhook] ${req.method} ${pathname} from ${req.socket.remoteAddress ?? "?"}`,
+    )
     void webhookHandler(req, res)
   })
 
   await new Promise<void>((resolve, reject) => {
     server.listen(port, () => {
-      log(`🚀 ts-tiny-claw 飞书 Webhook 已启动，监听 :${port}`)
+      log(`🚀 ts-tiny-claw 飞书服务端已启动，正在监听 :${port} 端口`)
       log(`   路径: http://localhost:${port}/webhook/event`)
       log(`   注意: 请求地址必须是公网 IPv4；内网可用 ws 长连接入口`)
       resolve()
@@ -414,12 +459,41 @@ async function runFeishuWebhook(
 /**
  * 飞书长连接入口：不用 HTTP EventListener / 不用公网 Webhook URL。
  * 开放平台事件订阅方式选「使用长连接接收事件」。
+ * 同样挂载审批 Middleware，与 webhook 行为一致。
  */
 async function runFeishuLongConnection(
   eng: AgentEngine,
+  registry: Registry,
   workDir: string,
 ): Promise<void> {
-  const bot = createFeishuBot(eng, workDir)
+  const sessionID = "test_command_intercept_001"
+  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
+  sess.append({ role: "user", content: "" })
+
+  const bot = createFeishuBot(eng, sess)
+
+  registry.use(async (_ctx, call) => {
+    const argsStr =
+      typeof call.arguments === "string"
+        ? call.arguments
+        : JSON.stringify(call.arguments ?? {})
+
+    if (isDangerousCommand(call.name, argsStr)) {
+      const taskID = call.id
+      const { allowed, reason } = await globalApprovalMgr.waitForApproval(
+        taskID,
+        call.name,
+        argsStr,
+        bot.reporter(),
+      )
+      if (!allowed) {
+        return { allowed: false, rejectReason: reason }
+      }
+      return { allowed: true, rejectReason: "" }
+    }
+    return { allowed: true, rejectReason: "" }
+  })
+
   log("🚀 ts-tiny-claw 飞书长连接模式启动中…")
   log("   请在开放平台将订阅方式改为「使用长连接接收事件」")
   await bot.startLongConnection()
@@ -447,24 +521,23 @@ async function main() {
         )
         process.exit(1)
       }
-      // 本讲关闭 Plan 模式，便于观察纠偏推理
-      const eng = createEngine(workDir, false, false)
+      const { eng } = createEngine(workDir, false, false)
       await runOneShotPrompt(eng, workDir, prompt.trim())
       break
     }
     case "repl": {
-      const eng = createEngine(workDir, false, false)
+      const { eng } = createEngine(workDir, false, false)
       await runRepl(eng, workDir)
       break
     }
     case "webhook": {
-      const eng = createEngine(workDir, false, false)
-      await runFeishuWebhook(eng, workDir)
+      const { eng, registry } = createEngine(workDir, false, false)
+      await runFeishuWebhook(eng, registry, workDir)
       break
     }
     case "ws": {
-      const eng = createEngine(workDir, false, false)
-      await runFeishuLongConnection(eng, workDir)
+      const { eng, registry } = createEngine(workDir, false, false)
+      await runFeishuLongConnection(eng, registry, workDir)
       break
     }
   }
