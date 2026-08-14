@@ -117,6 +117,16 @@ export class OpenAIProvider implements LLMProvider {
       content: choice.content ?? "",
     }
 
+    // 【新增】提取 Usage 信息
+    const promptTokens = resp.usage?.prompt_tokens ?? 0
+    const completionTokens = resp.usage?.completion_tokens ?? 0
+    if (promptTokens > 0 || completionTokens > 0) {
+      resultMsg.usage = {
+        promptTokens,
+        completionTokens,
+      }
+    }
+
     if (toolCalls.length > 0) {
       resultMsg.toolCalls = toolCalls
     }

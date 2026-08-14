@@ -4,6 +4,7 @@ export {
   ToolCallSchema,
   ToolDefinitionSchema,
   ToolResultSchema,
+  UsageSchema,
 } from "../schema/message.ts"
 
 export type {
@@ -12,4 +13,5 @@ export type {
   ToolCall,
   ToolDefinition,
   ToolResult,
+  Usage,
 } from "../schema/message.ts"

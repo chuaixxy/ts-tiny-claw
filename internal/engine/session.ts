@@ -16,6 +16,11 @@ export class Session {
   readonly createdAt: Date
   updatedAt: Date
 
+  // 【新增】用于统计该 Session 累计消耗的资源
+  totalPromptTokens = 0
+  totalCompletionTokens = 0
+  totalCostCNY = 0
+
   /** 存放此 Session 中所有的用户输入、大模型回复和工具调用结果 */
   private history: Message[] = []
 
@@ -25,6 +30,14 @@ export class Session {
     this.createdAt = new Date()
     this.updatedAt = new Date()
     this.history = []
+  }
+
+  /** RecordUsage 是一个给外部 Tracker 调用的辅助方法，用于累加账单 */
+  recordUsage(prompt: number, completion: number, cost: number): void {
+    // 对应 Go: s.mu.Lock() —— Node 同步方法无 await 让出，天然互斥
+    this.totalPromptTokens += prompt
+    this.totalCompletionTokens += completion
+    this.totalCostCNY += cost
   }
 
   /** Append 线程安全地向 Session 中追加消息 */

@@ -144,6 +144,16 @@ export class ClaudeProvider implements LLMProvider {
       content,
     }
 
+    // 【新增】提取 Usage 信息（Anthropic: input_tokens / output_tokens）
+    const promptTokens = resp.usage?.input_tokens ?? 0
+    const completionTokens = resp.usage?.output_tokens ?? 0
+    if (promptTokens > 0 || completionTokens > 0) {
+      resultMsg.usage = {
+        promptTokens,
+        completionTokens,
+      }
+    }
+
     if (toolCalls.length > 0) {
       resultMsg.toolCalls = toolCalls
     }

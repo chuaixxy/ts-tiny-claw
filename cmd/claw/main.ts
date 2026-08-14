@@ -1,11 +1,12 @@
 /* npx tsx cmd/claw/main.ts */
 // 对应 Go: cmd/claw/main.go
 //
-// 本讲默认：多智能体协同 —— 主引擎全功能兵器库 + 子智能体只读冷兵器库。
+// 本讲默认：CostTracker 装饰 Provider，打印 Token / 耗时 / 费用仪表盘。
 //            用法: npx tsx cmd/claw/main.ts
 //
 // 其它入口（互斥，由 argv / CLAW_MODE 选择）：
 //   -prompt  自定义一次性任务
+//   subagent 多智能体协同演示
 //   doom     死循环干预演示
 //   session  并发 Session A/B mock + Working Memory 截断
 //   repl     终端交互 REPL
@@ -30,6 +31,7 @@ import {
   isDangerousCommand,
 } from "../../internal/feishu/approval.ts"
 import { error as logError, log } from "../../internal/log/log.ts"
+import { createCostTracker } from "../../internal/observability/tracker.ts"
 import { createOpenAIProvider } from "../../internal/provider/openai.ts"
 // 也可换成 Claude 兼容端点：createClaudeProvider from "../../internal/provider/claude.ts"
 import { createBashTool } from "../../internal/tools/bash.ts"
@@ -52,6 +54,7 @@ function loadDotEnv(): void {
 loadDotEnv()
 
 type RunMode =
+  | "observability"
   | "subagent"
   | "doom"
   | "prompt"
@@ -61,6 +64,8 @@ type RunMode =
   | "ws"
 
 const MODE_ALIASES = new Set([
+  "observability",
+  "tracker",
   "subagent",
   "doom",
   "doomloop",
@@ -81,7 +86,7 @@ const MODE_ALIASES = new Set([
 /**
  * 对应 Go: flag.String("prompt", "", ...) + flag.Parse()
  * 同时兼容 --prompt / -prompt，以及历史入口模式名。
- * 本讲无参默认走多智能体协同（spawn_subagent）演示。
+ * 本讲无参默认走 CostTracker 可观测性演示。
  */
 function parseArgs(argv: string[]): {
   mode: RunMode
@@ -125,6 +130,9 @@ function parseArgs(argv: string[]): {
   if (raw === "subagent") {
     return { mode: "subagent", prompt }
   }
+  if (raw === "observability" || raw === "tracker") {
+    return { mode: "observability", prompt }
+  }
 
   // 显式提供了 -prompt：跑自定义任务
   if (prompt.trim()) {
@@ -136,8 +144,8 @@ function parseArgs(argv: string[]): {
     return { mode: "prompt", prompt: rest.join(" ").trim() }
   }
 
-  // 对应 Go 本讲默认：多智能体协同测试
-  return { mode: "subagent", prompt }
+  // 对应 Go 本讲默认：带仪表盘的可观测性测试
+  return { mode: "observability", prompt }
 }
 
 /** 确保工作区目录存在（WorkDir 跟随 Session，不再挂在 Engine 上） */
@@ -296,7 +304,58 @@ async function runConcurrentSessionDemo(): Promise<void> {
 }
 
 /**
- * 本讲默认入口：对齐 Go main —— 主引擎全功能兵器库 + 子智能体只读冷兵器库。
+ * 本讲默认入口：对齐 Go main —— CostTracker 包裹真实 Provider，打印 Token/费用仪表盘。
+ */
+const OBSERVABILITY_DEMO_PROMPT = `请用 bash 帮我用 date 命令查一下现在的时间。`
+
+async function runObservabilityDemo(workDir: string): Promise<void> {
+  if (!process.env.LLM_API_KEY) {
+    logError("请先设置 LLM_API_KEY 环境变量（可写在项目根目录 .env）")
+    process.exit(1)
+  }
+  if (!process.env.LLM_BASE_URL) {
+    logError("请先设置 LLM_BASE_URL 环境变量（可写在项目根目录 .env）")
+    process.exit(1)
+  }
+
+  const modelName = process.env.LLM_MODEL ?? "glm-4.5-air"
+
+  // 1. 初始化真实的底层大脑
+  const realProvider = createOpenAIProvider(modelName)
+
+  const sessionID = "test_observability_001"
+  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
+
+  // 2. 核心拼装：用 Tracker 将真实的大脑包裹起来
+  const trackedProvider = createCostTracker(realProvider, modelName, sess)
+
+  const registry = createRegistry()
+  registry.register(createBashTool(workDir))
+
+  // 3. 将被包裹的 Provider 注入给 Engine (Engine 毫不知情)
+  const eng = new AgentEngine(trackedProvider, registry, false, false)
+  const reporter = createTerminalReporter()
+
+  log("\n>>> 🚀 启动带仪表盘的可观测性测试...")
+  sess.append({ role: "user", content: OBSERVABILITY_DEMO_PROMPT })
+
+  try {
+    await eng.run(undefined, sess, reporter)
+  } catch (err) {
+    logError("引擎运行崩溃:", err)
+    process.exit(1)
+  }
+
+  log("\n================ 财务报表 ================")
+  log(`会话 ID: ${sess.id}`)
+  log(`总消耗 Input Tokens: ${sess.totalPromptTokens}`)
+  log(`总消耗 Output Tokens: ${sess.totalCompletionTokens}`)
+  log(`总计费用 (CNY): ¥${sess.totalCostCNY.toFixed(6)}`)
+  log("==========================================")
+}
+
+/**
+ * 上一讲入口：主引擎全功能兵器库 + 子智能体只读冷兵器库。
  */
 const SUBAGENT_DEMO_PROMPT = `
     我需要你在这个遗留项目里，找到那个“核心密码”。
@@ -580,6 +639,10 @@ async function main() {
   const workDir = ensureWorkDir()
 
   switch (mode) {
+    case "observability": {
+      await runObservabilityDemo(workDir)
+      break
+    }
     case "subagent": {
       await runSubagentDemo(workDir)
       break

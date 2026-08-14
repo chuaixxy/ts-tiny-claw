@@ -13,6 +13,15 @@ export const ToolCallSchema = z.object({
 })
 export type ToolCall = z.infer<typeof ToolCallSchema>
 
+/** Usage 记录了单次大模型 API 调用的 Token 消耗 */
+export const UsageSchema = z.object({
+  /** 输入的 Token 数量 */
+  promptTokens: z.number().int(),
+  /** 产生的 Token 数量 */
+  completionTokens: z.number().int(),
+})
+export type Usage = z.infer<typeof UsageSchema>
+
 /** 对话消息，构成与大模型交互的上下文 */
 export const MessageSchema = z.object({
   role: RoleSchema,
@@ -21,6 +30,8 @@ export const MessageSchema = z.object({
   toolCalls: z.array(ToolCallSchema).optional(),
   /** 工具调用结果所对应的 ToolCall ID（仅工具结果消息携带） */
   toolCallId: z.string().optional(),
+  /** 【新增】如果这是大模型 (Assistant) 的回复，此字段存放本次调用的 Token 消耗 */
+  usage: UsageSchema.optional(),
 })
 export type Message = z.infer<typeof MessageSchema>
 
