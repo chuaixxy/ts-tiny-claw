@@ -16,16 +16,20 @@ export class AgentEngine {
 
   /** 慢思考模式开关 */
   readonly enableThinking: boolean
+  /** 【新增】暴露给外部的计划模式开关 */
+  readonly planMode: boolean
 
   // 【注意】：我们移除了 Engine 层级的 WorkDir，因为 WorkDir 现在应该跟随 Session 走！
   constructor(
     provider: LLMProvider,
     registry: Registry,
     enableThinking: boolean,
+    planMode = false,
   ) {
     this.provider = provider
     this.registry = registry
     this.enableThinking = enableThinking
+    this.planMode = planMode
   }
 
   /**
@@ -41,13 +45,15 @@ export class AgentEngine {
     session: Session,
     reporter: Reporter,
   ): Promise<void> {
-    // 对应 Go: log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", session.ID, session.WorkDir)
-    log(`[Engine] 唤醒会话 [${session.id}]，锁定工作区: ${session.workDir}`)
+    // 对应 Go: log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s (PlanMode: %v)\n", ...)
+    log(
+      `[Engine] 唤醒会话 [${session.id}]，锁定工作区: ${session.workDir} (PlanMode: ${this.planMode})`,
+    )
     verbose(`[Engine] 慢思考模式 (Thinking Phase): ${this.enableThinking}`)
 
-    // 根据当前 Session 的工作区，动态组装最新的 System Prompt
-    // 对应 Go: composer := ctxpkg.NewPromptComposer(session.WorkDir)
-    const composer = createPromptComposer(session.workDir)
+    // 在每次运行前，动态生成组装器并传入当前的 PlanMode 状态
+    // 对应 Go: composer := ctxpkg.NewPromptComposer(session.WorkDir, e.PlanMode)
+    const composer = createPromptComposer(session.workDir, this.planMode)
     const systemMsg = composer.build()
 
     let turnCount = 0

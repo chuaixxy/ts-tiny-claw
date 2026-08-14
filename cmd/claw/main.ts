@@ -1,16 +1,12 @@
-/* npx tsx cmd/claw/main.ts [session|cli|webhook|ws] [可选: 一次性 prompt] */
+/* npx tsx cmd/claw/main.ts -prompt "你的任务指令" */
 // 对应 Go: cmd/claw/main.go
 //
-// Node 提供多种对话入口（互斥，由 argv / CLAW_MODE 选择）：
+// 本讲默认：通过 -prompt / --prompt 接收人类指令，开启 PlanMode。
+//            用法: npx tsx cmd/claw/main.ts -prompt "写一个简单的 HTTP 服务"
 //
-//   session  本讲默认：并发 Session A/B mock（对齐 Go main）+ Working Memory 截断
-//            用法: npx tsx cmd/claw/main.ts
-//                  npx tsx cmd/claw/main.ts session
-//
-//   cli      终端一次性任务 / REPL
-//            用法: npx tsx cmd/claw/main.ts cli "读取 a.txt 并总结"
-//                  npx tsx cmd/claw/main.ts repl
-//
+// 其它入口（互斥，由 argv / CLAW_MODE 选择）：
+//   session  并发 Session A/B mock + Working Memory 截断
+//   repl     终端交互 REPL
 //   webhook  飞书 HTTP 事件订阅（需公网 URL）
 //   ws       飞书长连接（开放平台选「使用长连接接收事件」）
 
@@ -45,15 +41,14 @@ function loadDotEnv(): void {
 
 loadDotEnv()
 
-type RunMode = "cli" | "session" | "webhook" | "ws"
+type RunMode = "prompt" | "session" | "repl" | "webhook" | "ws"
 
 const MODE_ALIASES = new Set([
-  "cli",
-  "repl",
-  "chat",
   "session",
   "concurrent",
   "memory",
+  "repl",
+  "chat",
   "webhook",
   "feishu",
   "http",
@@ -62,43 +57,54 @@ const MODE_ALIASES = new Set([
   "long-connection",
 ])
 
-function parseMode(argv: string[]): {
+/**
+ * 对应 Go: flag.String("prompt", "", ...) + flag.Parse()
+ * 同时兼容 --prompt / -prompt，以及历史入口模式名。
+ */
+function parseArgs(argv: string[]): {
   mode: RunMode
-  oneShotPrompt?: string
-  interactive?: boolean
+  prompt: string
 } {
-  // 优先 CLAW_MODE；否则看第一个参数；无参默认跑本讲 session mock（对齐 Go main）
-  const envMode = process.env.CLAW_MODE?.trim().toLowerCase()
-  const arg0 = argv[0]?.toLowerCase()
+  let prompt = ""
+  const rest: string[] = []
 
-  const raw = envMode || arg0 || "session"
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === "-prompt" || arg === "--prompt") {
+      prompt = argv[++i] ?? ""
+      continue
+    }
+    if (arg.startsWith("-prompt=") || arg.startsWith("--prompt=")) {
+      prompt = arg.slice(arg.indexOf("=") + 1)
+      continue
+    }
+    rest.push(arg)
+  }
+
+  const envMode = process.env.CLAW_MODE?.trim().toLowerCase()
+  const arg0 = rest[0]?.toLowerCase()
+  const raw = envMode || arg0 || ""
+
   if (raw === "webhook" || raw === "feishu" || raw === "http") {
-    return { mode: "webhook" }
+    return { mode: "webhook", prompt }
   }
   if (raw === "ws" || raw === "websocket" || raw === "long-connection") {
-    return { mode: "ws" }
+    return { mode: "ws", prompt }
   }
-  // 对应 Go 本讲 main：并发 Session A/B + Working Memory 截断演示
   if (raw === "session" || raw === "concurrent" || raw === "memory") {
-    return { mode: "session" }
+    return { mode: "session", prompt }
   }
-  // repl / chat：交互式；cli 或不带模式：一次性（默认跑 Go 演示 prompt）
   if (raw === "repl" || raw === "chat") {
-    return { mode: "cli", interactive: true }
-  }
-  if (raw === "cli") {
-    const oneShot = argv.slice(1).join(" ").trim()
-    return oneShot
-      ? { mode: "cli", oneShotPrompt: oneShot }
-      : { mode: "cli" }
+    return { mode: "repl", prompt }
   }
 
-  // 未识别的首参：当作 cli 的一次性 prompt（方便 npx tsx cmd/claw/main.ts 帮我读 a.txt）
-  if (arg0 && !MODE_ALIASES.has(arg0)) {
-    return { mode: "cli", oneShotPrompt: argv.join(" ").trim() }
+  // 未识别的首参且不像模式名：当作 prompt 兜底（方便不写 -prompt）
+  if (arg0 && !MODE_ALIASES.has(arg0) && !prompt) {
+    return { mode: "prompt", prompt: rest.join(" ").trim() }
   }
 
-  return { mode: "cli" }
+  // 对应 Go 本讲默认：必须通过 -prompt 接收指令
+  return { mode: "prompt", prompt }
 }
 
 /** 确保工作区目录存在（WorkDir 跟随 Session，不再挂在 Engine 上） */
@@ -113,10 +119,14 @@ function ensureWorkDir(): string {
   return workDir
 }
 
-/** 1. 初始化引擎依赖（各入口共用） */
+/**
+ * 初始化引擎依赖。
+ * 对应 Go: NewAgentEngine(llmProvider, registry, enableThinking, planMode)
+ */
 function createEngine(
   workDir: string,
-  enableThinking = true,
+  enableThinking = false,
+  planMode = true,
 ): AgentEngine {
   // 默认使用智谱 GLM-4（Go 检查 ZHIPU_API_KEY；本仓库统一用 OpenAI 兼容的 LLM_*）
   if (!process.env.LLM_API_KEY) {
@@ -132,6 +142,7 @@ function createEngine(
   const model = process.env.LLM_MODEL ?? "glm-4.5-air"
   const llmProvider = createOpenAIProvider(model)
 
+  // 挂载 4 大基础工具
   const registry = createRegistry()
   registry.register(createReadFileTool(workDir))
   registry.register(createWriteFileTool(workDir))
@@ -139,19 +150,9 @@ function createEngine(
   registry.register(createEditFileTool(workDir))
 
   // 实例化引擎；【注意】WorkDir 已从 Engine 移除，跟随 Session 走
-  // EnableThinking = true：Phase 1 剥夺工具，强制规划后再行动
-  // 飞书 ws/webhook 本讲关闭慢思考，对齐 Go 演示、减少半程等待
-  return new AgentEngine(llmProvider, registry, enableThinking)
+  // 本讲默认：EnableThinking=false，PlanMode=true
+  return new AgentEngine(llmProvider, registry, enableThinking, planMode)
 }
-
-/**
- * 对应 Go main 里的默认演示任务：测动态 Prompt + TerminalReporter。
- * 无自定义 prompt 时跑这一条；交互 REPL 请用: npx tsx cmd/claw/main.ts repl
- */
-const DEFAULT_DEMO_PROMPT = `
-    我需要在当前目录下新建一个 ping.js（Node.js），提供一个简单的 http ping 接口。
-    写完之后，帮我把代码用 git 提交一下。
-    `
 
 /** 本讲演示用的前后端工作区（对应 Go: /tmp/project_front|back） */
 function ensureSessionDemoProjects(): {
@@ -177,7 +178,7 @@ function ensureSessionDemoProjects(): {
 }
 
 /**
- * 对应 Go 本讲 main.go：同一无状态 AgentEngine 上并发跑 Session A / Session B。
+ * 对应上一讲 Session mock：同一无状态 AgentEngine 上并发跑 Session A / Session B。
  * - Session A（前端群）：长程对话刷爆 Working Memory(6)，观察是否忘掉第一轮密钥
  * - Session B（后端群）：错开 1s 发起，验证物理隔离（看不到 A 的历史）
  * Promise.all ≈ sync.WaitGroup
@@ -203,7 +204,7 @@ async function runConcurrentSessionDemo(): Promise<void> {
 
   // 引擎本身变成无状态的，它不绑定 WorkDir（仅适用于本讲演示）
   // 对应 Go: eng := engine.NewAgentEngine(llmProvider, registry, false)
-  const eng = new AgentEngine(llmProvider, registry, false)
+  const eng = new AgentEngine(llmProvider, registry, false, false)
   const reporter = createTerminalReporter()
 
   log("🚀 并发 Session 演示：前端群 (A) + 后端群 (B) 同时请求同一 AgentEngine")
@@ -260,59 +261,63 @@ async function runConcurrentSessionDemo(): Promise<void> {
 }
 
 /**
- * CLI 入口：不用飞书 EventListener，直接在终端和 Agent 对话。
- * 【注入新实现的终端输出器】对应 Go: reporter := engine.NewTerminalReporter()
+ * 本讲默认入口：对齐 Go main —— -prompt + PlanMode=true + 固定 SessionID。
+ *
+ * 我们使用一个固定的 SessionID，以便在多次运行之间共享基于内存的“短期工作记忆”。
+ * (在真实的 CLI 中，如果进程重启，Session 的内存历史其实是丢失的。
+ * 但这正是我们要演示的重点：即便短期内存丢失，只要 TODO.md 还在，任务就能继续！)
  */
-async function runCli(
+async function runPlanModePrompt(
   eng: AgentEngine,
   workDir: string,
-  oneShotPrompt?: string,
-  interactive = false,
+  prompt: string,
 ): Promise<void> {
-  // 【注入新实现的终端输出器】
   const reporter = createTerminalReporter()
-  // CLI 复用同一 Session，多轮对话共享 Working Memory
-  const session = globalSessionMgr.getOrCreate("cli", workDir)
+  const sessionID = "task_web_server_01"
+  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
 
-  if (interactive) {
-    log("🚀 ts-tiny-claw CLI REPL（EnableThinking=true，工作区 workspace/）")
-    log("   输入任务后回车；空行或 exit / quit 退出")
-    log("   其他入口: npx tsx cmd/claw/main.ts webhook | ws")
-    log("   调试引擎内部轨迹: CLAW_VERBOSE=1 npx tsx cmd/claw/main.ts")
+  log(`\n>>> 🚀 收到指令: ${prompt}`)
 
-    const rl = readline.createInterface({ input, output })
-    try {
-      while (true) {
-        const line = (await rl.question("\n你> ")).trim()
-        if (!line || line === "exit" || line === "quit") {
-          log("[CLI] 再见")
-          break
-        }
-        try {
-          // 入口层负责把用户输入写入 Session，再唤醒引擎
-          session.append({ role: "user", content: line })
-          await eng.run(undefined, session, reporter)
-        } catch (err) {
-          logError("[CLI] 引擎运行崩溃:", err)
-        }
-      }
-    } finally {
-      rl.close()
-    }
-    return
-  }
+  // 将用户的 Prompt 压入 Session
+  sess.append({ role: "user", content: prompt })
 
-  // 对应 Go: err := eng.Run(context.Background(), session, reporter)
-  const prompt = oneShotPrompt?.trim() || DEFAULT_DEMO_PROMPT
-  log(`[CLI] EnableThinking=true，工作区=${workDir}`)
-  log(`[CLI] 任务:\n${prompt}`)
+  // 唤醒引擎执行
   try {
-    session.append({ role: "user", content: prompt })
-    await eng.run(undefined, session, reporter)
+    await eng.run(undefined, sess, reporter)
   } catch (err) {
     // 对应 Go: log.Fatalf("引擎运行崩溃: %v", err)
     logError("引擎运行崩溃:", err)
     process.exit(1)
+  }
+}
+
+/** 交互式 REPL（非本讲默认；保留以便本地调试） */
+async function runRepl(eng: AgentEngine, workDir: string): Promise<void> {
+  const reporter = createTerminalReporter()
+  const session = globalSessionMgr.getOrCreate("cli", workDir)
+
+  log("🚀 ts-tiny-claw CLI REPL（工作区 workspace/）")
+  log("   输入任务后回车；空行或 exit / quit 退出")
+  log("   本讲默认用法: npx tsx cmd/claw/main.ts -prompt \"你的任务\"")
+  log("   调试引擎内部轨迹: CLAW_VERBOSE=1 ...")
+
+  const rl = readline.createInterface({ input, output })
+  try {
+    while (true) {
+      const line = (await rl.question("\n你> ")).trim()
+      if (!line || line === "exit" || line === "quit") {
+        log("[CLI] 再见")
+        break
+      }
+      try {
+        session.append({ role: "user", content: line })
+        await eng.run(undefined, session, reporter)
+      } catch (err) {
+        logError("[CLI] 引擎运行崩溃:", err)
+      }
+    }
+  } finally {
+    rl.close()
   }
 }
 
@@ -374,9 +379,6 @@ async function runFeishuWebhook(
 /**
  * 飞书长连接入口：不用 HTTP EventListener / 不用公网 Webhook URL。
  * 开放平台事件订阅方式选「使用长连接接收事件」。
- *
- * 本讲双 Session 并发 / Working Memory 截断测试见下方 mock（对齐 Go main），
- * 不要在飞书路径里再做「工具跟 Session.WorkDir 走」——讲义未实现。
  */
 async function runFeishuLongConnection(
   eng: AgentEngine,
@@ -389,30 +391,45 @@ async function runFeishuLongConnection(
 }
 
 async function main() {
-  const { mode, oneShotPrompt, interactive } = parseMode(process.argv.slice(2))
+  const { mode, prompt } = parseArgs(process.argv.slice(2))
 
-  // 对应 Go 本讲 main.go：默认 / session 模式跑双 Session mock
-  // ================= 模拟并发场景 1：飞书前端群 =================
-  // ================= 模拟并发场景 2：飞书后端群 =================
-  // （实现见 runConcurrentSessionDemo；讲义不实现工具跟随 Session.WorkDir）
   if (mode === "session") {
     await runConcurrentSessionDemo()
     return
   }
 
+  // 对应 Go 本讲默认：必须提供 -prompt
+  if (mode === "prompt" && !prompt.trim()) {
+    console.log(
+      '用法: npx tsx cmd/claw/main.ts -prompt "你的任务指令"',
+    )
+    process.exit(1)
+  }
+
   const workDir = ensureWorkDir()
-  const eng = createEngine(workDir, true)
 
   switch (mode) {
-    case "cli":
-      await runCli(eng, workDir, oneShotPrompt, interactive === true)
+    case "prompt": {
+      // 对应 Go: eng := engine.NewAgentEngine(llmProvider, registry, false, true)
+      const eng = createEngine(workDir, false, true)
+      await runPlanModePrompt(eng, workDir, prompt.trim())
       break
-    case "webhook":
+    }
+    case "repl": {
+      const eng = createEngine(workDir, false, true)
+      await runRepl(eng, workDir)
+      break
+    }
+    case "webhook": {
+      const eng = createEngine(workDir, false, true)
       await runFeishuWebhook(eng, workDir)
       break
-    case "ws":
+    }
+    case "ws": {
+      const eng = createEngine(workDir, false, true)
       await runFeishuLongConnection(eng, workDir)
       break
+    }
   }
 }
 
