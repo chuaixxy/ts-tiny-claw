@@ -2,6 +2,10 @@
 // 对应 Go: internal/engine/loop.go
 
 import { createPromptComposer } from "../context/composer.ts"
+import {
+  createRecoveryManager,
+  type RecoveryManager,
+} from "../context/recovery.ts"
 import { log, verbose } from "../log/log.ts"
 import type { LLMProvider } from "../provider/provider.ts"
 import type { Message } from "../provider/schema.ts"
@@ -13,6 +17,8 @@ import type { Session } from "./session.ts"
 export class AgentEngine {
   private provider: LLMProvider
   private registry: Registry
+  /** 【新增】自愈管理器 */
+  private recovery: RecoveryManager
 
   /** 慢思考模式开关 */
   readonly enableThinking: boolean
@@ -30,6 +36,8 @@ export class AgentEngine {
     this.registry = registry
     this.enableThinking = enableThinking
     this.planMode = planMode
+    // 对应 Go: recovery: ctxpkg.NewRecoveryManager()
+    this.recovery = createRecoveryManager()
   }
 
   /**
@@ -127,7 +135,7 @@ export class AgentEngine {
         `[Engine] 模型请求并发调用 ${actionResp.toolCalls.length} 个工具...`,
       )
 
-      // 4. ================= 并发执行底层工具 =================
+      // 4. ================= 执行工具并注入自愈模板 =================
       //
       // 三个驾驭工程细节（对应 Go 的 Goroutine + WaitGroup 实践）：
       // 1) 并发安全 / 闭包陷阱：用 map(async (toolCall, idx) => ...) 传参，
@@ -149,17 +157,25 @@ export class AgentEngine {
           verbose(`  -> [Go-${idx}] 🛠️ 触发并行执行: ${toolCall.name}`)
           await reporter.onToolCall(ctx, toolCall.name, args)
 
+          // 底层物理执行工具
           const result = await this.registry.execute(ctx, toolCall)
 
+          // 【核心拦截与注入】
+          let finalOutput = result.output
           if (result.isError) {
-            verbose(`  -> [Go-${idx}] ❌ 工具执行报错: ${result.output}`)
+            // 发生错误，交由 RecoveryManager 诊断并注入“锦囊妙计”
+            finalOutput = this.recovery.analyzeAndInject(
+              toolCall.name,
+              result.output,
+            )
+            log(`  -> [Go-${idx}] ❌ 注入救援指南: ${finalOutput}`)
           } else {
             verbose(
               `  -> [Go-${idx}] ✅ 工具执行成功 (返回 ${result.output.length} 字节)`,
             )
           }
 
-          let displayOutput = result.output
+          let displayOutput = finalOutput
           if (displayOutput.length > 200) {
             displayOutput = displayOutput.slice(0, 200) + "... (已截断)"
           }
@@ -170,10 +186,10 @@ export class AgentEngine {
             result.isError,
           )
 
-          // 专属 idx 坑位写入（无锁、保序）
+          // 将注入过 Recovery Hint 的最终结果写入上下文历史（专属 idx 坑位，无锁、保序）
           observationMsgs[idx] = {
             role: "user",
-            content: result.output,
+            content: finalOutput,
             toolCallId: toolCall.id,
           }
         }),

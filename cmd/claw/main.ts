@@ -1,10 +1,11 @@
-/* npx tsx cmd/claw/main.ts -prompt "你的任务指令" */
+/* npx tsx cmd/claw/main.ts */
 // 对应 Go: cmd/claw/main.go
 //
-// 本讲默认：通过 -prompt / --prompt 接收人类指令，开启 PlanMode。
-//            用法: npx tsx cmd/claw/main.ts -prompt "写一个简单的 HTTP 服务"
+// 本讲默认：关闭 PlanMode，跑 edit_file 自愈纠偏演示（auth.ts 陷阱指令）。
+//            用法: npx tsx cmd/claw/main.ts
 //
 // 其它入口（互斥，由 argv / CLAW_MODE 选择）：
+//   -prompt  自定义一次性任务（本讲同样关闭 PlanMode）
 //   session  并发 Session A/B mock + Working Memory 截断
 //   repl     终端交互 REPL
 //   webhook  飞书 HTTP 事件订阅（需公网 URL）
@@ -41,9 +42,10 @@ function loadDotEnv(): void {
 
 loadDotEnv()
 
-type RunMode = "prompt" | "session" | "repl" | "webhook" | "ws"
+type RunMode = "recovery" | "prompt" | "session" | "repl" | "webhook" | "ws"
 
 const MODE_ALIASES = new Set([
+  "recovery",
   "session",
   "concurrent",
   "memory",
@@ -60,6 +62,7 @@ const MODE_ALIASES = new Set([
 /**
  * 对应 Go: flag.String("prompt", "", ...) + flag.Parse()
  * 同时兼容 --prompt / -prompt，以及历史入口模式名。
+ * 本讲无参默认走 recovery 自愈演示。
  */
 function parseArgs(argv: string[]): {
   mode: RunMode
@@ -97,14 +100,22 @@ function parseArgs(argv: string[]): {
   if (raw === "repl" || raw === "chat") {
     return { mode: "repl", prompt }
   }
+  if (raw === "recovery") {
+    return { mode: "recovery", prompt }
+  }
 
-  // 未识别的首参且不像模式名：当作 prompt 兜底（方便不写 -prompt）
-  if (arg0 && !MODE_ALIASES.has(arg0) && !prompt) {
+  // 显式提供了 -prompt：跑自定义任务
+  if (prompt.trim()) {
+    return { mode: "prompt", prompt }
+  }
+
+  // 未识别的首参且不像模式名：当作 prompt 兜底
+  if (arg0 && !MODE_ALIASES.has(arg0)) {
     return { mode: "prompt", prompt: rest.join(" ").trim() }
   }
 
-  // 对应 Go 本讲默认：必须通过 -prompt 接收指令
-  return { mode: "prompt", prompt }
+  // 对应 Go 本讲默认：无参启动自愈测试
+  return { mode: "recovery", prompt }
 }
 
 /** 确保工作区目录存在（WorkDir 跟随 Session，不再挂在 Engine 上） */
@@ -126,7 +137,7 @@ function ensureWorkDir(): string {
 function createEngine(
   workDir: string,
   enableThinking = false,
-  planMode = true,
+  planMode = false,
 ): AgentEngine {
   // 默认使用智谱 GLM-4（Go 检查 ZHIPU_API_KEY；本仓库统一用 OpenAI 兼容的 LLM_*）
   if (!process.env.LLM_API_KEY) {
@@ -150,7 +161,7 @@ function createEngine(
   registry.register(createEditFileTool(workDir))
 
   // 实例化引擎；【注意】WorkDir 已从 Engine 移除，跟随 Session 走
-  // 本讲默认：EnableThinking=false，PlanMode=true
+  // 本讲默认：EnableThinking=false，PlanMode=false（关闭计划模式，专注自愈纠偏）
   return new AgentEngine(llmProvider, registry, enableThinking, planMode)
 }
 
@@ -261,13 +272,54 @@ async function runConcurrentSessionDemo(): Promise<void> {
 }
 
 /**
- * 本讲默认入口：对齐 Go main —— -prompt + PlanMode=true + 固定 SessionID。
+ * 本讲默认入口：对齐 Go main —— 关闭 PlanMode，固定陷阱 prompt 诱发 edit_file 失败并观察自愈。
  *
- * 我们使用一个固定的 SessionID，以便在多次运行之间共享基于内存的“短期工作记忆”。
- * (在真实的 CLI 中，如果进程重启，Session 的内存历史其实是丢失的。
- * 但这正是我们要演示的重点：即便短期内存丢失，只要 TODO.md 还在，任务就能继续！)
+ * 这是一个巨大的陷阱指令：
+ * 我们不给它查看文件的机会，直接命令它凭初始上下文去修改文件，目的是诱发 old_text 不匹配的错误。
  */
-async function runPlanModePrompt(
+const RECOVERY_TRAP_PROMPT = `
+    我当前目录下有一个 auth.ts 文件。
+    请修改 auth.ts 中的 login 函数，将判断条件改为同时允许"admin"、"root"和"guest"三种用户登录。
+
+    【强制约束】：
+    1. 禁止先调用 read_file / bash 查看文件。
+    2. 第一次必须立刻调用 edit_file。
+    3. old_text 必须原样复制下面整段代码（一个字符都不要改，包括注释和缩进），new_text 再写你的修改版。
+
+    // 鉴权入口函数
+    export function login(user: string): boolean {
+        // 检查用户名
+        if (user === "admin") {
+            return true
+        }
+        return false
+    }
+`
+
+async function runRecoveryDemo(workDir: string): Promise<void> {
+  // 关闭 Plan 模式，专注于见证它改变主意的单点纠偏过程
+  // 对应 Go: eng := engine.NewAgentEngine(llmProvider, registry, false, false)
+  const eng = createEngine(workDir, false, false)
+  const reporter = createTerminalReporter()
+
+  const sessionID = "test_recovery_001"
+  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
+
+  log("\n>>> 🚀 启动自愈测试任务...")
+  sess.append({ role: "user", content: RECOVERY_TRAP_PROMPT })
+
+  try {
+    await eng.run(undefined, sess, reporter)
+  } catch (err) {
+    logError("引擎运行崩溃:", err)
+    process.exit(1)
+  }
+}
+
+/**
+ * 自定义 -prompt 入口（本讲同样关闭 PlanMode）。
+ */
+async function runOneShotPrompt(
   eng: AgentEngine,
   workDir: string,
   prompt: string,
@@ -277,15 +329,11 @@ async function runPlanModePrompt(
   const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
 
   log(`\n>>> 🚀 收到指令: ${prompt}`)
-
-  // 将用户的 Prompt 压入 Session
   sess.append({ role: "user", content: prompt })
 
-  // 唤醒引擎执行
   try {
     await eng.run(undefined, sess, reporter)
   } catch (err) {
-    // 对应 Go: log.Fatalf("引擎运行崩溃: %v", err)
     logError("引擎运行崩溃:", err)
     process.exit(1)
   }
@@ -298,7 +346,7 @@ async function runRepl(eng: AgentEngine, workDir: string): Promise<void> {
 
   log("🚀 ts-tiny-claw CLI REPL（工作区 workspace/）")
   log("   输入任务后回车；空行或 exit / quit 退出")
-  log("   本讲默认用法: npx tsx cmd/claw/main.ts -prompt \"你的任务\"")
+  log("   本讲默认用法: npx tsx cmd/claw/main.ts")
   log("   调试引擎内部轨迹: CLAW_VERBOSE=1 ...")
 
   const rl = readline.createInterface({ input, output })
@@ -398,35 +446,37 @@ async function main() {
     return
   }
 
-  // 对应 Go 本讲默认：必须提供 -prompt
-  if (mode === "prompt" && !prompt.trim()) {
-    console.log(
-      '用法: npx tsx cmd/claw/main.ts -prompt "你的任务指令"',
-    )
-    process.exit(1)
-  }
-
   const workDir = ensureWorkDir()
 
   switch (mode) {
+    case "recovery": {
+      await runRecoveryDemo(workDir)
+      break
+    }
     case "prompt": {
-      // 对应 Go: eng := engine.NewAgentEngine(llmProvider, registry, false, true)
-      const eng = createEngine(workDir, false, true)
-      await runPlanModePrompt(eng, workDir, prompt.trim())
+      if (!prompt.trim()) {
+        console.log(
+          '用法: npx tsx cmd/claw/main.ts -prompt "你的任务指令"',
+        )
+        process.exit(1)
+      }
+      // 本讲关闭 Plan 模式，便于观察纠偏推理
+      const eng = createEngine(workDir, false, false)
+      await runOneShotPrompt(eng, workDir, prompt.trim())
       break
     }
     case "repl": {
-      const eng = createEngine(workDir, false, true)
+      const eng = createEngine(workDir, false, false)
       await runRepl(eng, workDir)
       break
     }
     case "webhook": {
-      const eng = createEngine(workDir, false, true)
+      const eng = createEngine(workDir, false, false)
       await runFeishuWebhook(eng, workDir)
       break
     }
     case "ws": {
-      const eng = createEngine(workDir, false, true)
+      const eng = createEngine(workDir, false, false)
       await runFeishuLongConnection(eng, workDir)
       break
     }
