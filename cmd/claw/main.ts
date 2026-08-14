@@ -1,7 +1,7 @@
 /* npx tsx cmd/claw/main.ts */
 // 对应 Go: cmd/claw/main.go
 //
-// 本讲默认：关闭 PlanMode，跑 edit_file 自愈纠偏演示（auth.ts 陷阱指令）。
+// 本讲默认：关闭 PlanMode，跑死循环干预演示（反复 read_file 不存在的 secret_key.txt）。
 //            用法: npx tsx cmd/claw/main.ts
 //
 // 其它入口（互斥，由 argv / CLAW_MODE 选择）：
@@ -42,9 +42,11 @@ function loadDotEnv(): void {
 
 loadDotEnv()
 
-type RunMode = "recovery" | "prompt" | "session" | "repl" | "webhook" | "ws"
+type RunMode = "doom" | "prompt" | "session" | "repl" | "webhook" | "ws"
 
 const MODE_ALIASES = new Set([
+  "doom",
+  "doomloop",
   "recovery",
   "session",
   "concurrent",
@@ -62,7 +64,7 @@ const MODE_ALIASES = new Set([
 /**
  * 对应 Go: flag.String("prompt", "", ...) + flag.Parse()
  * 同时兼容 --prompt / -prompt，以及历史入口模式名。
- * 本讲无参默认走 recovery 自愈演示。
+ * 本讲无参默认走 doom loop 死循环干预演示。
  */
 function parseArgs(argv: string[]): {
   mode: RunMode
@@ -100,8 +102,8 @@ function parseArgs(argv: string[]): {
   if (raw === "repl" || raw === "chat") {
     return { mode: "repl", prompt }
   }
-  if (raw === "recovery") {
-    return { mode: "recovery", prompt }
+  if (raw === "doom" || raw === "doomloop" || raw === "recovery") {
+    return { mode: "doom", prompt }
   }
 
   // 显式提供了 -prompt：跑自定义任务
@@ -114,8 +116,8 @@ function parseArgs(argv: string[]): {
     return { mode: "prompt", prompt: rest.join(" ").trim() }
   }
 
-  // 对应 Go 本讲默认：无参启动自愈测试
-  return { mode: "recovery", prompt }
+  // 对应 Go 本讲默认：无参启动死循环干预测试
+  return { mode: "doom", prompt }
 }
 
 /** 确保工作区目录存在（WorkDir 跟随 Session，不再挂在 Engine 上） */
@@ -161,7 +163,7 @@ function createEngine(
   registry.register(createEditFileTool(workDir))
 
   // 实例化引擎；【注意】WorkDir 已从 Engine 移除，跟随 Session 走
-  // 本讲默认：EnableThinking=false，PlanMode=false（关闭计划模式，专注自愈纠偏）
+  // 本讲默认：EnableThinking=false，PlanMode=false（关闭计划模式，专注死循环干预）
   return new AgentEngine(llmProvider, registry, enableThinking, planMode)
 }
 
@@ -272,41 +274,26 @@ async function runConcurrentSessionDemo(): Promise<void> {
 }
 
 /**
- * 本讲默认入口：对齐 Go main —— 关闭 PlanMode，固定陷阱 prompt 诱发 edit_file 失败并观察自愈。
- *
- * 这是一个巨大的陷阱指令：
- * 我们不给它查看文件的机会，直接命令它凭初始上下文去修改文件，目的是诱发 old_text 不匹配的错误。
+ * 本讲默认入口：对齐 Go main —— 关闭 PlanMode，诱导模型对不存在的文件原样重试 read_file，
+ * 以便观察 ReminderInjector 在连续失败后的死循环干预。
  */
-const RECOVERY_TRAP_PROMPT = `
-    我当前目录下有一个 auth.ts 文件。
-    请修改 auth.ts 中的 login 函数，将判断条件改为同时允许"admin"、"root"和"guest"三种用户登录。
-
-    【强制约束】：
-    1. 禁止先调用 read_file / bash 查看文件。
-    2. 第一次必须立刻调用 edit_file。
-    3. old_text 必须原样复制下面整段代码（一个字符都不要改，包括注释和缩进），new_text 再写你的修改版。
-
-    // 鉴权入口函数
-    export function login(user: string): boolean {
-        // 检查用户名
-        if (user === "admin") {
-            return true
-        }
-        return false
-    }
+const DOOM_LOOP_PROMPT = `
+    帮我读取当前目录下的 secret_key.txt。
+    注意：我们的文件系统现在非常不稳定，经常报 File Not Found。
+    如果报错了，请你【千万不要改变参数】，直接原样再次调用 read_file 尝试，直到成功或连续重试 5 次为止。
 `
 
-async function runRecoveryDemo(workDir: string): Promise<void> {
-  // 关闭 Plan 模式，专注于见证它改变主意的单点纠偏过程
+async function runDoomLoopDemo(workDir: string): Promise<void> {
+  // 关闭 Plan 模式，让它在死胡同里专注地展示挣扎过程
   // 对应 Go: eng := engine.NewAgentEngine(llmProvider, registry, false, false)
   const eng = createEngine(workDir, false, false)
   const reporter = createTerminalReporter()
 
-  const sessionID = "test_recovery_001"
+  const sessionID = "test_doom_loop_001"
   const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
 
-  log("\n>>> 🚀 启动自愈测试任务...")
-  sess.append({ role: "user", content: RECOVERY_TRAP_PROMPT })
+  log("\n>>> 🚀 启动死循环干预测试...")
+  sess.append({ role: "user", content: DOOM_LOOP_PROMPT })
 
   try {
     await eng.run(undefined, sess, reporter)
@@ -449,8 +436,8 @@ async function main() {
   const workDir = ensureWorkDir()
 
   switch (mode) {
-    case "recovery": {
-      await runRecoveryDemo(workDir)
+    case "doom": {
+      await runDoomLoopDemo(workDir)
       break
     }
     case "prompt": {

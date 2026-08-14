@@ -8,8 +8,12 @@ import {
 } from "../context/recovery.ts"
 import { log, verbose } from "../log/log.ts"
 import type { LLMProvider } from "../provider/provider.ts"
-import type { Message } from "../provider/schema.ts"
+import type { Message, ToolCall, ToolResult } from "../provider/schema.ts"
 import type { Registry } from "../tools/registry.ts"
+import {
+  createReminderInjector,
+  type ReminderInjector,
+} from "./reminder.ts"
 import type { Reporter } from "./reporter.ts"
 import type { Session } from "./session.ts"
 
@@ -19,6 +23,8 @@ export class AgentEngine {
   private registry: Registry
   /** 【新增】自愈管理器 */
   private recovery: RecoveryManager
+  /** 【新增】提醒注入器 */
+  private injector: ReminderInjector
 
   /** 慢思考模式开关 */
   readonly enableThinking: boolean
@@ -38,6 +44,8 @@ export class AgentEngine {
     this.planMode = planMode
     // 对应 Go: recovery: ctxpkg.NewRecoveryManager()
     this.recovery = createRecoveryManager()
+    // 对应 Go: injector: NewReminderInjector()
+    this.injector = createReminderInjector()
   }
 
   /**
@@ -135,7 +143,7 @@ export class AgentEngine {
         `[Engine] 模型请求并发调用 ${actionResp.toolCalls.length} 个工具...`,
       )
 
-      // 4. ================= 执行工具并注入自愈模板 =================
+      // 4. ================= 执行工具并记录 =================
       //
       // 三个驾驭工程细节（对应 Go 的 Goroutine + WaitGroup 实践）：
       // 1) 并发安全 / 闭包陷阱：用 map(async (toolCall, idx) => ...) 传参，
@@ -145,6 +153,11 @@ export class AgentEngine {
       // 3) 上下文顺序对齐：模型返回 [ToolA, ToolB] 时期望 [ResultA, ResultB]；
       //    全部完成后再按索引顺序 append，避免乱序追加造成阅读混乱。
       const observationMsgs: Message[] = new Array(actionResp.toolCalls.length)
+
+      // 用于收集本轮执行的最后一个工具，供 Reminder 探测器分析
+      // (在真实的工业级架构中，如果并发调用了多个工具，我们可以逐个分析或仅分析报错的那个。这里简化为取第一个)
+      let lastToolCall: ToolCall | undefined
+      let lastToolResult: ToolResult | undefined
 
       // Promise.all ≈ sync.WaitGroup.Wait()：并发跑完再继续
       await Promise.all(
@@ -192,6 +205,12 @@ export class AgentEngine {
             content: finalOutput,
             toolCallId: toolCall.id,
           }
+
+          // 捕获状态供外部探测器使用
+          if (idx === 0) {
+            lastToolCall = toolCall
+            lastToolResult = result
+          }
         }),
       )
 
@@ -199,9 +218,21 @@ export class AgentEngine {
         "[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...",
       )
 
-      // 将所有的工具执行结果（Observation）持久化到 Session 中，开启下一轮的复盘与推理
-      // 下一轮循环会通过 GetWorkingMemory 从 Session 重新组装上下文，无需再改本轮 contextHistory
+      // 1. 先将普通的工具执行结果存入 Session
       session.append(...observationMsgs)
+
+      // 2. 【核心防线】：在准备进入下一轮之前，进行死循环探测！
+      if (lastToolCall && lastToolResult) {
+        const reminderMsg = this.injector.checkAndInject(
+          lastToolCall,
+          lastToolResult,
+        )
+        if (reminderMsg) {
+          // 如果触发了干预规则，将这条严厉的提醒作为 User 消息，强制追加到 Session 的最末尾！
+          // 大模型在下一轮被唤醒时，第一眼就会看到这句话，从而打破局部执念。
+          session.append(reminderMsg)
+        }
+      }
     }
   }
 }
