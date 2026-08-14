@@ -7,6 +7,13 @@ import {
   type RecoveryManager,
 } from "../context/recovery.ts"
 import { log, verbose } from "../log/log.ts"
+import {
+  asTraceContext,
+  exportTraceToFile,
+  signalOf,
+  startSpan,
+  type TraceContext,
+} from "../observability/trace.ts"
 import type { LLMProvider } from "../provider/provider.ts"
 import type { Message, ToolCall, ToolResult } from "../provider/schema.ts"
 import type { Registry } from "../tools/registry.ts"
@@ -56,9 +63,11 @@ export class AgentEngine implements AgentRunner {
    *
    * 讲义同款：工具 Registry 仍在构造时绑定固定 WorkDir；Session.WorkDir 主要用于
    * PromptComposer。双目录文件隔离靠 main 里 mock（Session B 不准调工具）。
+   *
+   * ctx 可为 AbortSignal（历史调用方）或 TraceContext（带 Span 级联）。
    */
   async run(
-    ctx: AbortSignal | undefined,
+    ctx: AbortSignal | TraceContext | undefined,
     session: Session,
     reporter: Reporter,
   ): Promise<void> {
@@ -68,143 +77,210 @@ export class AgentEngine implements AgentRunner {
     )
     verbose(`[Engine] 慢思考模式 (Thinking Phase): ${this.enableThinking}`)
 
-    // 在每次运行前，动态生成组装器并传入当前的 PlanMode 状态
-    // 对应 Go: composer := ctxpkg.NewPromptComposer(session.WorkDir, e.PlanMode)
-    const composer = createPromptComposer(session.workDir, this.planMode)
-    const systemMsg = composer.build()
+    // 【埋点 1】：开启 Root Span，记录整个任务的生命周期
+    let traceCtx: TraceContext | undefined
+    let rootSpan: ReturnType<typeof startSpan>[1]
+    ;[traceCtx, rootSpan] = startSpan(asTraceContext(ctx), "Agent.Run")
+    rootSpan.addAttribute("SessionID", session.id)
+    rootSpan.addAttribute("WorkDir", session.workDir)
 
-    // The Main Loop: 心跳开始 (标准的 ReAct 循环)
-    while (true) {
-      if (ctx?.aborted) break
+    try {
+      // 在每次运行前，动态生成组装器并传入当前的 PlanMode 状态
+      // 对应 Go: composer := ctxpkg.NewPromptComposer(session.WorkDir, e.PlanMode)
+      const composer = createPromptComposer(session.workDir, this.planMode)
+      const systemMsg = composer.build()
 
-      const availableTools = this.registry.getAvailableTools()
+      let turnCount = 0
 
-      // 对应 Go: workingMemory := session.GetWorkingMemory(20)
-      const workingMemory = session.getWorkingMemory(20)
+      // The Main Loop: 心跳开始 (标准的 ReAct 循环)
+      while (true) {
+        if (signalOf(traceCtx)?.aborted) break
 
-      const contextHistory: Message[] = [systemMsg, ...workingMemory]
-      // 对应 Go: compactedContext := e.compactor.Compact(contextHistory)
-      // TS 尚未移植 Compactor，此处透传
-      let compactedContext = contextHistory
+        turnCount++
 
-      let currentTurnThinkingContent = ""
-
-      // ================= Phase 1: Thinking =================
-      if (this.enableThinking) {
-        verbose("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
-        await reporter.onThinking(ctx)
-
-        log("[Engine] 正在请求 LLM（慢思考，无工具）…")
-        const thinkResp = await this.provider.generate(
-          ctx,
-          compactedContext,
-          undefined,
+        // 【埋点 2】：记录单次 Turn 循环
+        // 注意：Go 讲义在 for 里写 defer EndSpan 会拖到函数退出才跑；
+        // Node 用每轮 try/finally，保证本轮结束即结算耗时。
+        const [turnCtx, turnSpan] = startSpan(
+          traceCtx,
+          `Turn-${turnCount}`,
         )
-        log("[Engine] LLM 慢思考返回")
 
-        if (thinkResp.content) {
-          currentTurnThinkingContent = thinkResp.content
-          verbose(`🧠 [内部思考 Trace]: ${thinkResp.content}`)
-          // 对应 Go：仅追加到本轮 compactedContext，不单独写入 Session
-          compactedContext = [...compactedContext, thinkResp]
-        }
-      }
+        try {
+          const availableTools = this.registry.getAvailableTools()
 
-      // ================= Phase 2: Action =================
-      verbose("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
+          // 对应 Go: workingMemory := session.GetWorkingMemory(20)
+          const workingMemory = session.getWorkingMemory(20)
 
-      log("[Engine] 正在请求 LLM（行动阶段，挂载工具）…")
-      const actionResp = await this.provider.generate(
-        ctx,
-        compactedContext,
-        availableTools,
-      )
-      log("[Engine] LLM 行动阶段返回")
+          const contextHistory: Message[] = [systemMsg, ...workingMemory]
+          // 对应 Go: compactedContext := e.compactor.Compact(contextHistory)
+          // TS 尚未移植 Compactor，此处透传
+          let compactedContext = contextHistory
 
-      // 对应 Go：合并 Thinking + Action 为合法的单条 Assistant 消息
-      const finalAssistantMsg: Message = {
-        role: "assistant",
-        content: [currentTurnThinkingContent, actionResp.content ?? ""]
-          .join("\n")
-          .trim(),
-        toolCalls: actionResp.toolCalls,
-      }
-      session.append(finalAssistantMsg)
-
-      if (actionResp.content) {
-        verbose(`🤖 [对外回复]: ${actionResp.content}`)
-        await reporter.onMessage(ctx, actionResp.content)
-      }
-
-      if (!actionResp.toolCalls || actionResp.toolCalls.length === 0) {
-        verbose("[Engine] 模型未请求调用工具，任务宣告完成。")
-        break
-      }
-
-      verbose(
-        `[Engine] 模型请求并发调用 ${actionResp.toolCalls.length} 个工具...`,
-      )
-
-      const observationMsgs: Message[] = new Array(actionResp.toolCalls.length)
-
-      // 用于收集本轮执行的最后一个工具供 Reminder 分析
-      let lastToolCall: ToolCall | undefined
-      let lastToolResult: ToolResult | undefined
-
-      await Promise.all(
-        actionResp.toolCalls.map(async (toolCall, idx) => {
-          const args =
-            typeof toolCall.arguments === "string"
-              ? toolCall.arguments
-              : JSON.stringify(toolCall.arguments ?? {})
-
-          await reporter.onToolCall(ctx, toolCall.name, args)
-
-          const result = await this.registry.execute(ctx, toolCall)
-
-          let finalOutput = result.output
-          if (result.isError) {
-            finalOutput = this.recovery.analyzeAndInject(
-              toolCall.name,
-              result.output,
-            )
-          }
-
-          let displayOutput = finalOutput
-          if (displayOutput.length > 200) {
-            displayOutput = displayOutput.slice(0, 200) + "... (已截断)"
-          }
-          await reporter.onToolResult(
-            ctx,
-            toolCall.name,
-            displayOutput,
-            result.isError,
+          // 记录发给模型的实际上下文大小，非常有助于排查幻觉
+          turnSpan.addAttribute(
+            "context_message_count",
+            compactedContext.length,
           )
 
-          observationMsgs[idx] = {
-            role: "user",
-            content: finalOutput,
-            toolCallId: toolCall.id,
+          let currentTurnThinkingContent = ""
+
+          // ================= Phase 1: Thinking =================
+          if (this.enableThinking) {
+            verbose(
+              "[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...",
+            )
+            await reporter.onThinking(signalOf(turnCtx))
+
+            // 【埋点 3】：记录 Thinking 调用
+            const [thinkCtx, thinkSpan] = startSpan(turnCtx, "LLM.Thinking")
+            log("[Engine] 正在请求 LLM（慢思考，无工具）…")
+            let thinkResp: Message
+            try {
+              thinkResp = await this.provider.generate(
+                signalOf(thinkCtx),
+                compactedContext,
+                undefined,
+              )
+            } finally {
+              thinkSpan.endSpan()
+            }
+            log("[Engine] LLM 慢思考返回")
+
+            if (thinkResp.content) {
+              currentTurnThinkingContent = thinkResp.content
+              verbose(`🧠 [内部思考 Trace]: ${thinkResp.content}`)
+              // 对应 Go：仅追加到本轮 compactedContext，不单独写入 Session
+              compactedContext = [...compactedContext, thinkResp]
+            }
           }
 
-          if (idx === 0) {
-            lastToolCall = toolCall
-            lastToolResult = result
+          // ================= Phase 2: Action =================
+          verbose("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
+
+          // 【埋点 4】：记录 Action 调用
+          const [actCtx, actSpan] = startSpan(turnCtx, "LLM.Action")
+          log("[Engine] 正在请求 LLM（行动阶段，挂载工具）…")
+          let actionResp: Message
+          try {
+            actionResp = await this.provider.generate(
+              signalOf(actCtx),
+              compactedContext,
+              availableTools,
+            )
+          } finally {
+            actSpan.endSpan()
           }
-        }),
-      )
+          log("[Engine] LLM 行动阶段返回")
 
-      session.append(...observationMsgs)
+          // 对应 Go：合并 Thinking + Action 为合法的单条 Assistant 消息
+          const finalAssistantMsg: Message = {
+            role: "assistant",
+            content: [currentTurnThinkingContent, actionResp.content ?? ""]
+              .join("\n")
+              .trim(),
+            toolCalls: actionResp.toolCalls,
+          }
+          session.append(finalAssistantMsg)
 
-      // 【核心防线】：在进入下一轮前，进行死循环探测与注入
-      if (lastToolCall && lastToolResult) {
-        const reminderMsg = this.injector.checkAndInject(
-          lastToolCall,
-          lastToolResult,
-        )
-        if (reminderMsg) {
-          session.append(reminderMsg)
+          if (actionResp.content) {
+            verbose(`🤖 [对外回复]: ${actionResp.content}`)
+            await reporter.onMessage(signalOf(turnCtx), actionResp.content)
+          }
+
+          if (!actionResp.toolCalls || actionResp.toolCalls.length === 0) {
+            verbose("[Engine] 模型未请求调用工具，任务宣告完成。")
+            break
+          }
+
+          verbose(
+            `[Engine] 模型请求并发调用 ${actionResp.toolCalls.length} 个工具...`,
+          )
+
+          const observationMsgs: Message[] = new Array(
+            actionResp.toolCalls.length,
+          )
+
+          // 用于收集本轮执行的最后一个工具供 Reminder 分析
+          let lastToolCall: ToolCall | undefined
+          let lastToolResult: ToolResult | undefined
+
+          // 并发执行工具：传 turnCtx，多个 Tool.Execute Span 平行挂在 Turn 下
+          await Promise.all(
+            actionResp.toolCalls.map(async (toolCall, idx) => {
+              const args =
+                typeof toolCall.arguments === "string"
+                  ? toolCall.arguments
+                  : JSON.stringify(toolCall.arguments ?? {})
+
+              await reporter.onToolCall(
+                signalOf(turnCtx),
+                toolCall.name,
+                args,
+              )
+
+              const result = await this.registry.execute(turnCtx, toolCall)
+
+              let finalOutput = result.output
+              if (result.isError) {
+                finalOutput = this.recovery.analyzeAndInject(
+                  toolCall.name,
+                  result.output,
+                )
+              }
+
+              let displayOutput = finalOutput
+              if (displayOutput.length > 200) {
+                displayOutput = displayOutput.slice(0, 200) + "... (已截断)"
+              }
+              await reporter.onToolResult(
+                signalOf(turnCtx),
+                toolCall.name,
+                displayOutput,
+                result.isError,
+              )
+
+              observationMsgs[idx] = {
+                role: "user",
+                content: finalOutput,
+                toolCallId: toolCall.id,
+              }
+
+              if (idx === 0) {
+                lastToolCall = toolCall
+                lastToolResult = result
+              }
+            }),
+          )
+
+          session.append(...observationMsgs)
+
+          // 【核心防线】：在进入下一轮前，进行死循环探测与注入
+          if (lastToolCall && lastToolResult) {
+            const reminderMsg = this.injector.checkAndInject(
+              lastToolCall,
+              lastToolResult,
+            )
+            if (reminderMsg) {
+              session.append(reminderMsg)
+            }
+          }
+        } finally {
+          turnSpan.endSpan()
         }
+      }
+    } finally {
+      // defer：无论成功失败，结束根 Span 并导出 Trace 报告
+      rootSpan.endSpan()
+      try {
+        await exportTraceToFile(rootSpan, session.workDir, session.id)
+        log(
+          "📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下",
+        )
+      } catch (err) {
+        log(
+          `📊 [Tracing] 导出 Trace 失败: ${err instanceof Error ? err.message : String(err)}`,
+        )
       }
     }
   }

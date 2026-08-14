@@ -1,10 +1,11 @@
 /* npx tsx cmd/claw/main.ts */
 // 对应 Go: cmd/claw/main.go
 //
-// 本讲默认：CostTracker 装饰 Provider，打印 Token / 耗时 / 费用仪表盘。
+// 本讲默认：Tracing 链路追踪 —— Agent.Run / Turn / LLM / Tool 调用树写入 .claw/traces。
 //            用法: npx tsx cmd/claw/main.ts
 //
 // 其它入口（互斥，由 argv / CLAW_MODE 选择）：
+//   observability / tracker  CostTracker Token/费用仪表盘
 //   -prompt  自定义一次性任务
 //   subagent 多智能体协同演示
 //   doom     死循环干预演示
@@ -54,6 +55,7 @@ function loadDotEnv(): void {
 loadDotEnv()
 
 type RunMode =
+  | "trace"
   | "observability"
   | "subagent"
   | "doom"
@@ -64,6 +66,8 @@ type RunMode =
   | "ws"
 
 const MODE_ALIASES = new Set([
+  "trace",
+  "tracing",
   "observability",
   "tracker",
   "subagent",
@@ -86,7 +90,7 @@ const MODE_ALIASES = new Set([
 /**
  * 对应 Go: flag.String("prompt", "", ...) + flag.Parse()
  * 同时兼容 --prompt / -prompt，以及历史入口模式名。
- * 本讲无参默认走 CostTracker 可观测性演示。
+ * 本讲无参默认走 Tracing 链路追踪演示。
  */
 function parseArgs(argv: string[]): {
   mode: RunMode
@@ -133,6 +137,9 @@ function parseArgs(argv: string[]): {
   if (raw === "observability" || raw === "tracker") {
     return { mode: "observability", prompt }
   }
+  if (raw === "trace" || raw === "tracing") {
+    return { mode: "trace", prompt }
+  }
 
   // 显式提供了 -prompt：跑自定义任务
   if (prompt.trim()) {
@@ -144,8 +151,8 @@ function parseArgs(argv: string[]): {
     return { mode: "prompt", prompt: rest.join(" ").trim() }
   }
 
-  // 对应 Go 本讲默认：带仪表盘的可观测性测试
-  return { mode: "observability", prompt }
+  // 对应 Go 本讲默认：带 Tracing 链路追踪的测试
+  return { mode: "trace", prompt }
 }
 
 /** 确保工作区目录存在（WorkDir 跟随 Session，不再挂在 Engine 上） */
@@ -304,7 +311,49 @@ async function runConcurrentSessionDemo(): Promise<void> {
 }
 
 /**
- * 本讲默认入口：对齐 Go main —— CostTracker 包裹真实 Provider，打印 Token/费用仪表盘。
+ * 本讲默认入口：对齐 Go main —— Tracing 并发工具调用树导出到 .claw/traces。
+ */
+const TRACE_DEMO_PROMPT = `请同时帮我做两件事（必须在同一次回复里并行发起两个工具调用，不要合并成一条命令）：
+1. 用 write_file 创建文件 trace_test.md，内容写「测试并发的写入」
+2. 用 bash 执行：sleep 2 && echo "系统环境检查完毕"
+两个都完成后，再用 bash 执行 ls -la trace_test.md && cat trace_test.md 验证文件。`
+
+async function runTraceDemo(workDir: string): Promise<void> {
+  if (!process.env.LLM_API_KEY) {
+    logError("请先设置 LLM_API_KEY 环境变量（可写在项目根目录 .env）")
+    process.exit(1)
+  }
+  if (!process.env.LLM_BASE_URL) {
+    logError("请先设置 LLM_BASE_URL 环境变量（可写在项目根目录 .env）")
+    process.exit(1)
+  }
+
+  const model = process.env.LLM_MODEL ?? "glm-4.5-air"
+  const llmProvider = createOpenAIProvider(model)
+
+  const sessionID = "test_trace_001"
+  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
+
+  const registry = createRegistry()
+  registry.register(createBashTool(workDir))
+  registry.register(createWriteFileTool(workDir))
+
+  const eng = new AgentEngine(llmProvider, registry, false, false)
+  const reporter = createTerminalReporter()
+
+  log("\n>>> 🚀 启动带 Tracing 链路追踪的测试...")
+  sess.append({ role: "user", content: TRACE_DEMO_PROMPT })
+
+  try {
+    await eng.run(undefined, sess, reporter)
+  } catch (err) {
+    logError("引擎运行崩溃:", err)
+    process.exit(1)
+  }
+}
+
+/**
+ * 上一讲入口：CostTracker 包裹真实 Provider，打印 Token/费用仪表盘。
  */
 const OBSERVABILITY_DEMO_PROMPT = `请用 bash 帮我用 date 命令查一下现在的时间。`
 
@@ -639,6 +688,10 @@ async function main() {
   const workDir = ensureWorkDir()
 
   switch (mode) {
+    case "trace": {
+      await runTraceDemo(workDir)
+      break
+    }
     case "observability": {
       await runObservabilityDemo(workDir)
       break

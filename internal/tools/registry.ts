@@ -2,6 +2,12 @@
 // 对应 Go: internal/tools/registry.go
 
 import { log, warn } from "../log/log.ts"
+import {
+  asTraceContext,
+  signalOf,
+  startSpan,
+  type TraceContext,
+} from "../observability/trace.ts"
 import type { ToolCall, ToolDefinition, ToolResult } from "../schema/message.ts"
 
 /**
@@ -49,9 +55,12 @@ export interface Registry {
 
   /**
    * 实际路由并执行模型请求的工具调用。
-   * ctx 对应 Go 的 context.Context，用于请求取消。
+   * ctx 可为 AbortSignal（历史调用方）或 TraceContext（挂到父 Span 下）。
    */
-  execute(ctx: AbortSignal | undefined, call: ToolCall): Promise<ToolResult>
+  execute(
+    ctx: AbortSignal | TraceContext | undefined,
+    call: ToolCall,
+  ): Promise<ToolResult>
 }
 
 /** Registry 接口的默认实现：以工具 Name 为 Key 做 O(1) 路由 */
@@ -77,44 +86,69 @@ class RegistryImpl implements Registry {
     return Array.from(this.tools.values()).map((tool) => tool.definition())
   }
 
-  async execute(ctx: AbortSignal | undefined, call: ToolCall): Promise<ToolResult> {
-    // 1. 路由查找：找不到说明模型产生了幻觉，直接向模型抛出错误
-    const tool = this.tools.get(call.name)
-    if (!tool) {
-      return {
-        toolCallId: call.id,
-        output: `Error: 系统中不存在名为 '${call.name}' 的工具。`,
-        isError: true,
-      }
-    }
+  async execute(
+    ctx: AbortSignal | TraceContext | undefined,
+    call: ToolCall,
+  ): Promise<ToolResult> {
+    // 【埋点 5】：开启工具执行的 Span（并发工具会平行挂在 Turn 节点下）
+    const [toolCtx, span] = startSpan(asTraceContext(ctx), "Tool.Execute")
+    span.addAttribute("tool_name", call.name)
+    // 将 JSON 参数存入以备调试
+    span.addAttribute("arguments", argsToString(call.arguments))
 
-    // 2. 【核心防御】在执行底层逻辑前，依次运行所有的 Middleware
-    for (const mw of this.middlewares) {
-      const { allowed, rejectReason } = await mw(ctx, call)
-      if (!allowed) {
-        log(`[Registry] ⚠️ 工具 ${call.name} 被 Middleware 拦截: ${rejectReason}`)
+    try {
+      // 1. 路由查找：找不到说明模型产生了幻觉，直接向模型抛出错误
+      const tool = this.tools.get(call.name)
+      if (!tool) {
+        const msg = `Error: 系统中不存在名为 '${call.name}' 的工具。`
+        span.addAttribute("error", msg)
         return {
           toolCallId: call.id,
-          output: `执行被系统拦截。原因: ${rejectReason}`,
-          isError: true, // 必须返回 Error，强制大模型阅读拒绝理由
+          output: msg,
+          isError: true,
         }
       }
-    }
 
-    // 3. 执行工具逻辑 (如果所有 Middleware 都放行了)
-    try {
-      const output = await tool.execute(ctx, toRawJSON(call.arguments))
-      return {
-        toolCallId: call.id,
-        output,
-        isError: false,
+      // 2. 【核心防御】在执行底层逻辑前，依次运行所有的 Middleware
+      const signal = signalOf(toolCtx)
+      for (const mw of this.middlewares) {
+        const { allowed, rejectReason } = await mw(signal, call)
+        if (!allowed) {
+          span.addAttribute("intercepted", true)
+          span.addAttribute("reject_reason", rejectReason)
+          log(
+            `[Registry] ⚠️ 工具 ${call.name} 被 Middleware 拦截: ${rejectReason}`,
+          )
+          return {
+            toolCallId: call.id,
+            output: `执行被系统拦截。原因: ${rejectReason}`,
+            isError: true, // 必须返回 Error，强制大模型阅读拒绝理由
+          }
+        }
       }
-    } catch (err) {
-      return {
-        toolCallId: call.id,
-        output: `Error executing ${call.name}: ${err instanceof Error ? err.message : String(err)}`,
-        isError: true,
+
+      // 3. 执行工具逻辑 (如果所有 Middleware 都放行了)
+      try {
+        const output = await tool.execute(signal, toRawJSON(call.arguments))
+        // 只截取输出的前 100 字符放入 Trace，防止 Trace 文件过度膨胀
+        span.addAttribute("output_preview", truncate(output, 100))
+        return {
+          toolCallId: call.id,
+          output,
+          isError: false,
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        span.addAttribute("error", errMsg)
+        return {
+          toolCallId: call.id,
+          output: `Error executing ${call.name}: ${errMsg}`,
+          isError: true,
+        }
       }
+    } finally {
+      // 无论成功失败，确保结束
+      span.endSpan()
     }
   }
 }
@@ -124,6 +158,20 @@ function toRawJSON(args: unknown): Uint8Array {
   if (args instanceof Uint8Array) return args
   if (typeof args === "string") return new TextEncoder().encode(args)
   return new TextEncoder().encode(JSON.stringify(args ?? null))
+}
+
+function argsToString(args: unknown): string {
+  if (typeof args === "string") return args
+  if (args instanceof Uint8Array) return new TextDecoder().decode(args)
+  return JSON.stringify(args ?? null)
+}
+
+/** 对应 Go: truncate —— 截断过长字符串，避免 Trace 膨胀 */
+function truncate(s: string, max: number): string {
+  if (s.length > max) {
+    return s.slice(0, max) + "..."
+  }
+  return s
 }
 
 /** 创建默认 Registry 实现 */
