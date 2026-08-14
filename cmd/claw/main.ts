@@ -1,15 +1,15 @@
 /* npx tsx cmd/claw/main.ts */
 // 对应 Go: cmd/claw/main.go
 //
-// 本讲默认：飞书 Webhook + 高危命令人工审批 Middleware。
+// 本讲默认：多智能体协同 —— 主引擎全功能兵器库 + 子智能体只读冷兵器库。
 //            用法: npx tsx cmd/claw/main.ts
-//                  npx tsx cmd/claw/main.ts webhook
 //
 // 其它入口（互斥，由 argv / CLAW_MODE 选择）：
-//   -prompt  自定义一次性任务（本讲同样关闭 PlanMode）
+//   -prompt  自定义一次性任务
 //   doom     死循环干预演示
 //   session  并发 Session A/B mock + Working Memory 截断
 //   repl     终端交互 REPL
+//   webhook  飞书 HTTP 事件订阅（需公网 URL）
 //   ws       飞书长连接（开放平台选「使用长连接接收事件」）
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs"
@@ -39,6 +39,7 @@ import {
   createRegistry,
   type Registry,
 } from "../../internal/tools/registry.ts"
+import { createSubagentTool } from "../../internal/tools/subagent.ts"
 import { createWriteFileTool } from "../../internal/tools/write-file.ts"
 
 /** Node 不会自动读 .env，启动时从工作区根目录加载 */
@@ -50,9 +51,17 @@ function loadDotEnv(): void {
 
 loadDotEnv()
 
-type RunMode = "doom" | "prompt" | "session" | "repl" | "webhook" | "ws"
+type RunMode =
+  | "subagent"
+  | "doom"
+  | "prompt"
+  | "session"
+  | "repl"
+  | "webhook"
+  | "ws"
 
 const MODE_ALIASES = new Set([
+  "subagent",
   "doom",
   "doomloop",
   "recovery",
@@ -72,7 +81,7 @@ const MODE_ALIASES = new Set([
 /**
  * 对应 Go: flag.String("prompt", "", ...) + flag.Parse()
  * 同时兼容 --prompt / -prompt，以及历史入口模式名。
- * 本讲无参默认走飞书 Webhook + 人工审批拦截。
+ * 本讲无参默认走多智能体协同（spawn_subagent）演示。
  */
 function parseArgs(argv: string[]): {
   mode: RunMode
@@ -113,6 +122,9 @@ function parseArgs(argv: string[]): {
   if (raw === "doom" || raw === "doomloop" || raw === "recovery") {
     return { mode: "doom", prompt }
   }
+  if (raw === "subagent") {
+    return { mode: "subagent", prompt }
+  }
 
   // 显式提供了 -prompt：跑自定义任务
   if (prompt.trim()) {
@@ -124,8 +136,8 @@ function parseArgs(argv: string[]): {
     return { mode: "prompt", prompt: rest.join(" ").trim() }
   }
 
-  // 对应 Go 本讲默认：启动飞书服务端 + 审批 Middleware
-  return { mode: "webhook", prompt }
+  // 对应 Go 本讲默认：多智能体协同测试
+  return { mode: "subagent", prompt }
 }
 
 /** 确保工作区目录存在（WorkDir 跟随 Session，不再挂在 Engine 上） */
@@ -284,7 +296,65 @@ async function runConcurrentSessionDemo(): Promise<void> {
 }
 
 /**
- * 本讲默认入口：对齐 Go main —— 关闭 PlanMode，诱导模型对不存在的文件原样重试 read_file，
+ * 本讲默认入口：对齐 Go main —— 主引擎全功能兵器库 + 子智能体只读冷兵器库。
+ */
+const SUBAGENT_DEMO_PROMPT = `
+    我需要你在这个遗留项目里，找到那个“核心密码”。
+    为了防止污染主上下文，请你务必派出子智能体（spawn_subagent）去执行探索任务。
+    你可以让子智能体使用 bash 去查找当前目录（及其所有子目录）下名为 config.txt 的文件。
+    子智能体拿到密码向你汇报后，请你亲自使用 write_file 工具，将密码写在根目录的 answer.txt 里。
+`
+
+async function runSubagentDemo(workDir: string): Promise<void> {
+  if (!process.env.LLM_API_KEY) {
+    logError("请先设置 LLM_API_KEY 环境变量（可写在项目根目录 .env）")
+    process.exit(1)
+  }
+  if (!process.env.LLM_BASE_URL) {
+    logError("请先设置 LLM_BASE_URL 环境变量（可写在项目根目录 .env）")
+    process.exit(1)
+  }
+
+  // 对应 Go: llmProvider := provider.NewZhipuOpenAIProvider("glm-4.5-air")
+  const model = process.env.LLM_MODEL ?? "glm-4.5-air"
+  const llmProvider = createOpenAIProvider(model)
+  const reporter = createTerminalReporter()
+
+  // 【防御沙箱】为子智能体准备受限的只读注册表
+  const readOnlyRegistry = createRegistry()
+  readOnlyRegistry.register(createReadFileTool(workDir))
+  readOnlyRegistry.register(createBashTool(workDir)) // 允许简单的 grep 等搜索操作
+
+  // 为主智能体准备全功能注册表
+  const mainRegistry = createRegistry()
+  mainRegistry.register(createReadFileTool(workDir))
+  mainRegistry.register(createWriteFileTool(workDir))
+  mainRegistry.register(createBashTool(workDir))
+  mainRegistry.register(createEditFileTool(workDir))
+
+  // 初始化主引擎
+  // 对应 Go: eng := engine.NewAgentEngine(llmProvider, mainRegistry, false, false)
+  const eng = new AgentEngine(llmProvider, mainRegistry, false, false)
+
+  // 【核心装配】：将带有 Engine 引用和只读 Registry 的 Subagent 工具注册进主线
+  mainRegistry.register(createSubagentTool(eng, readOnlyRegistry, reporter))
+
+  const sessionID = "test_subagent_001"
+  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
+
+  log("\n>>> 🚀 启动多智能体协同测试...")
+  sess.append({ role: "user", content: SUBAGENT_DEMO_PROMPT })
+
+  try {
+    await eng.run(undefined, sess, reporter)
+  } catch (err) {
+    logError("引擎运行崩溃:", err)
+    process.exit(1)
+  }
+}
+
+/**
+ * 本讲上一入口：关闭 PlanMode，诱导模型对不存在的文件原样重试 read_file，
  * 以便观察 ReminderInjector 在连续失败后的死循环干预。
  */
 const DOOM_LOOP_PROMPT = `
@@ -510,6 +580,10 @@ async function main() {
   const workDir = ensureWorkDir()
 
   switch (mode) {
+    case "subagent": {
+      await runSubagentDemo(workDir)
+      break
+    }
     case "doom": {
       await runDoomLoopDemo(workDir)
       break
