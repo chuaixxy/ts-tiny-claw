@@ -1,0 +1,29 @@
+{
+  "name": "Agent.Run",
+  "start_time": "2026-08-15T16:09:21.814Z",
+  "end_time": "2026-08-15T16:09:21.934Z",
+  "duration_ms": 120,
+  "attributes": {
+    "SessionID": "oc_948645d6f69fc2d4b935ef8b9560b156",
+    "WorkDir": "/Users/xxy/ai/ts-tiny-claw/workspace-v2"
+  },
+  "children": [
+    {
+      "name": "Turn-1",
+      "start_time": "2026-08-15T16:09:21.816Z",
+      "end_time": "2026-08-15T16:09:21.934Z",
+      "duration_ms": 118,
+      "attributes": {
+        "context_message_count": 4
+      },
+      "children": [
+        {
+          "name": "LLM.Action",
+          "start_time": "2026-08-15T16:09:21.816Z",
+          "end_time": "2026-08-15T16:09:21.934Z",
+          "duration_ms": 118
+        }
+      ]
+    }
+  ]
+}
