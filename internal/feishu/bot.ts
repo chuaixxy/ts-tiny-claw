@@ -14,6 +14,21 @@ import {
   type TraceContext,
 } from "../observability/trace.ts"
 import { globalApprovalMgr } from "./approval.ts"
+import {
+  classToDecision,
+  classifyIntent,
+  declineReply,
+} from "./intent-classifier.ts"
+import {
+  decideIntent,
+  fallbackUnsure,
+  isBotMentioned,
+  isIntentLlmEnabled,
+  normalizeChatType,
+  shouldReplyOnDrop,
+  type FeishuMention,
+  type IntentDecision,
+} from "./intent-filter.ts"
 
 /** 飞书 im.message.receive_v1 事件的最小载荷（Node SDK 回调 data 形状） */
 interface FeishuMessageEvent {
@@ -22,8 +37,10 @@ interface FeishuMessageEvent {
   }
   message: {
     chat_id: string
+    chat_type?: string
     message_type?: string
     content: string
+    mentions?: FeishuMention[]
   }
 }
 
@@ -191,12 +208,8 @@ export class FeishuBot {
           return undefined
         }
 
-        // 如果不是审批命令，则是正常对话，启动一个新的 Agent 任务去处理
-        //
-        // 【驾驭并发】：收到消息后，绝不能阻塞 HTTP 回调。
-        // Go: go b.handleAgentRun(chatId, contentStr)
-        // Node: void this.handleAgentRun(...) fire-and-forget
-        void this.handleAgentRun(chatId, contentStr)
+        // 意图闸门：群闲聊 / 私聊寒暄不得唤醒 Main Loop（先于 session.append）
+        this.maybeWakeAgent(chatId, contentStr, event)
 
         return undefined
       },
@@ -207,8 +220,111 @@ export class FeishuBot {
     })
   }
 
+  /**
+   * L1 规则 + 可选 L2 分类。不阻塞飞书回调。
+   * wake 才 handleAgentRun；drop 静默；unsure 按开关/回退策略。
+   */
+  private maybeWakeAgent(
+    chatId: string,
+    text: string,
+    event: FeishuMessageEvent,
+  ): void {
+    const chatType = event.message.chat_type ?? ""
+    const identity: { appId: string; openId?: string; name?: string } = {
+      appId: this.appId,
+    }
+    const openId = process.env.FEISHU_BOT_OPEN_ID?.trim()
+    if (openId) identity.openId = openId
+    const botName = process.env.FEISHU_BOT_NAME?.trim()
+    if (botName) identity.name = botName
+
+    const mentionedBot = isBotMentioned(event.message.mentions, identity)
+    if (
+      normalizeChatType(chatType) === "group" &&
+      (event.message.mentions?.length ?? 0) > 0 &&
+      !mentionedBot
+    ) {
+      log(
+        "[Intent] 群聊含 @ 但未识别为本机器人，可设置 FEISHU_BOT_OPEN_ID 或 FEISHU_BOT_NAME",
+      )
+    }
+    const l1 = decideIntent({ chatType, text, mentionedBot })
+    log(
+      `[Intent] chat=${chatId} type=${normalizeChatType(chatType)} mentioned=${mentionedBot} L1=${l1} text=${text.slice(0, 40)}`,
+    )
+
+    if (l1 === "wake") {
+      void this.handleAgentRun(chatId, text)
+      return
+    }
+    if (l1 === "drop") {
+      log(`[Intent] 丢弃: ${text.slice(0, 80)}`)
+      if (shouldReplyOnDrop(chatType, mentionedBot)) {
+        this.replyDecline(chatId, "ack")
+      }
+      return
+    }
+
+    if (!isIntentLlmEnabled()) {
+      const fb = fallbackUnsure()
+      log(`[Intent] L2 关闭，unsure→${fb}`)
+      if (fb === "wake") void this.handleAgentRun(chatId, text)
+      else if (shouldReplyOnDrop(chatType, mentionedBot)) {
+        this.replyDecline(chatId, "generic")
+      }
+      return
+    }
+
+    log(`[Intent] L1=unsure，交 L2 轻量分类: ${text.slice(0, 40)}`)
+    void this.classifyThenMaybeRun(chatId, text, chatType, mentionedBot)
+  }
+
+  private async classifyThenMaybeRun(
+    chatId: string,
+    text: string,
+    chatType: string,
+    mentionedBot: boolean,
+  ): Promise<void> {
+    const label = await classifyIntent(text)
+    let decision: IntentDecision
+    if (label) {
+      decision = classToDecision(label)
+      log(`[Intent] L2=${label} → ${decision}`)
+    } else {
+      decision = fallbackUnsure()
+      log(`[Intent] L2 失败，回退 ${decision}`)
+    }
+    if (decision === "wake") {
+      if (this.runningChats.has(chatId)) {
+        log(`[Intent] L2 决定唤醒但会话 ${chatId} 已在运行，忽略`)
+        return
+      }
+      void this.handleAgentRun(chatId, text)
+      return
+    }
+
+    if (shouldReplyOnDrop(chatType, mentionedBot)) {
+      const reason =
+        label === "ack" ? "ack" : label === "chitchat" ? "chitchat" : "generic"
+      this.replyDecline(chatId, reason)
+    }
+  }
+
+  private replyDecline(
+    chatId: string,
+    reason: "ack" | "chitchat" | "generic",
+  ): void {
+    const text = declineReply(reason)
+    log(`[Intent] 默认回复(${reason}): ${text}`)
+    void new FeishuReporter(this.client, chatId).sendMsg(text)
+  }
+
   /** handleAgentRun 是连接飞书与底层引擎的桥梁 */
   private async handleAgentRun(chatId: string, prompt: string): Promise<void> {
+    if (this.runningChats.has(chatId)) {
+      log(`[Feishu] 会话 ${chatId} 已在运行，跳过重复唤醒`)
+      return
+    }
     this.runningChats.add(chatId)
     try {
       await this.runAgentOnce(chatId, prompt)
