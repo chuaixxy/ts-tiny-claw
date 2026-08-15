@@ -56,13 +56,10 @@ export class Session {
    */
   getWorkingMemory(limit: number): Message[] {
     const total = this.history.length
-    if (total <= limit || limit <= 0) {
-      // 如果历史总量小于限制，或者不设限，全量返回 (需要深拷贝以防外部修改)
-      return cloneMessages(this.history)
-    }
-
-    // 截取最近的 limit 条消息
-    let res = cloneMessages(this.history.slice(total - limit))
+    let res =
+      total <= limit || limit <= 0
+        ? cloneMessages(this.history)
+        : cloneMessages(this.history.slice(total - limit))
 
     // 【驾驭防线】：大模型 API 强制要求历史消息的连续性！
     // 如果我们截断的第一条消息恰好是一个 ToolResult (RoleUser 且含有 ToolCallID)，
@@ -77,7 +74,9 @@ export class Session {
       }
     }
 
-    return res
+    // assistant.tool_calls 必须紧跟对应 tool 结果；审批等待期间插入的普通 user
+    // 会把配对打断（400 insufficient tool messages）。此处重排并补齐缺失结果。
+    return repairToolCallContinuity(res)
   }
 }
 
@@ -111,4 +110,55 @@ export const globalSessionMgr = new SessionManager()
 /** 浅拷贝消息列表，防止外部修改污染 Session 内部历史（对应 Go 的 copy） */
 function cloneMessages(msgs: Message[]): Message[] {
   return msgs.map((m) => ({ ...m }))
+}
+
+/**
+ * 保证每条带 toolCalls 的 assistant 后面紧跟齐全的 tool 结果。
+ * 插在中间的普通 user（例如把 approve 打成 pprove）会被挪到结果之后。
+ */
+function repairToolCallContinuity(msgs: Message[]): Message[] {
+  const out: Message[] = []
+  let i = 0
+  while (i < msgs.length) {
+    const msg = msgs[i]!
+    const calls = msg.role === "assistant" ? msg.toolCalls : undefined
+    if (!calls || calls.length === 0) {
+      out.push(msg)
+      i++
+      continue
+    }
+
+    out.push(msg)
+    i++
+    const needed = new Set(calls.map((tc) => tc.id))
+    const results: Message[] = []
+    const extras: Message[] = []
+
+    while (i < msgs.length && needed.size > 0) {
+      const next = msgs[i]!
+      if (next.role === "user" && next.toolCallId && needed.has(next.toolCallId)) {
+        results.push(next)
+        needed.delete(next.toolCallId)
+        i++
+        continue
+      }
+      if (next.role === "user" && next.toolCallId) {
+        i++ // 孤儿 tool result
+        continue
+      }
+      if (next.role === "assistant") break
+      extras.push(next)
+      i++
+    }
+
+    for (const id of needed) {
+      results.push({
+        role: "user",
+        content: "工具执行被中断，未返回结果。",
+        toolCallId: id,
+      })
+    }
+    out.push(...results, ...extras)
+  }
+  return out
 }

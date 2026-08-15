@@ -10,6 +10,10 @@ import path from "node:path"
  * TraceContext 对应 Go 的 context.Context（本讲起可携带 Span）。
  * - signal：请求取消（对应 Go ctx.Done() / AbortSignal）
  * - span：当前活跃 Span（对应 Go ctx.Value(traceKey{})）
+ * - reporter：当前会话专属 Reporter（对应 Go ctx.Value(reporterKey{})）
+ *
+ * reporter 用 unknown，避免 observability → engine 的包循环；
+ * 由 feishu.contextWithReporter / reporterFromContext 负责写入与提取。
  *
  * 引擎现有 API 仍多使用 AbortSignal；后续接线时可用
  * `{ signal: abortSignal }` 从旧 ctx 升格，或只传 `undefined`。
@@ -18,6 +22,8 @@ export type TraceContext = {
   signal?: AbortSignal
   /** 当前活跃 Span，对应 Go 的 traceKey */
   span?: Span
+  /** 对应 Go ctx.Value(reporterKey{})，随 startSpan 级联拷贝 */
+  reporter?: unknown
 }
 
 /** 将 AbortSignal / TraceContext 归一化为可级联的 TraceContext */
@@ -102,10 +108,14 @@ export function startSpan(
   }
 
   // 将当前新创建的 Span 作为最新的父节点，塞入衍生 Context 并返回
-  // exactOptionalPropertyTypes：有 signal 才写入，避免显式赋 undefined
+  // exactOptionalPropertyTypes：有值才写入，避免显式赋 undefined
+  // reporter 必须拷贝：否则 Middleware 在 Tool.Execute 子 Span 上取不到审批通道
   const newCtx: TraceContext = { span }
   if (ctx?.signal) {
     newCtx.signal = ctx.signal
+  }
+  if (ctx?.reporter !== undefined) {
+    newCtx.reporter = ctx.reporter
   }
   return [newCtx, span]
 }

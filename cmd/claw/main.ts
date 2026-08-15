@@ -26,13 +26,18 @@ import * as lark from "@larksuiteoapi/node-sdk"
 import { AgentEngine } from "../../internal/engine/loop.ts"
 import { globalSessionMgr } from "../../internal/engine/session.ts"
 import { createTerminalReporter } from "../../internal/engine/terminal-reporter.ts"
-import { createFeishuBot } from "../../internal/feishu/bot.ts"
+import {
+  createFeishuBot,
+  reporterFromContext,
+  type AgentEngineFactory,
+} from "../../internal/feishu/bot.ts"
 import {
   globalApprovalMgr,
   isDangerousCommand,
 } from "../../internal/feishu/approval.ts"
 import { error as logError, log } from "../../internal/log/log.ts"
 import { createCostTracker } from "../../internal/observability/tracker.ts"
+import type { LLMProvider } from "../../internal/provider/interface.ts"
 import { createOpenAIProvider } from "../../internal/provider/openai.ts"
 // 也可换成 Claude 兼容端点：createClaudeProvider from "../../internal/provider/claude.ts"
 import { createBashTool } from "../../internal/tools/bash.ts"
@@ -168,15 +173,14 @@ function ensureWorkDir(): string {
 }
 
 /**
- * 初始化引擎依赖。
- * 对应 Go: NewAgentEngine(llmProvider, registry, enableThinking, planMode)
- * 返回 registry，便于在 bot 创建后挂载审批 Middleware。
+ * 初始化共享的 LLM Provider 与工具 Registry。
+ * 飞书入口会把 Registry 挂到工厂产出的每一台引擎上，Middleware 只注册一次。
  */
-function createEngine(
-  workDir: string,
-  enableThinking = false,
-  planMode = false,
-): { eng: AgentEngine; registry: Registry } {
+function createProviderAndRegistry(workDir: string): {
+  llmProvider: LLMProvider
+  registry: Registry
+  model: string
+} {
   // 默认使用智谱 GLM-4（Go 检查 ZHIPU_API_KEY；本仓库统一用 OpenAI 兼容的 LLM_*）
   if (!process.env.LLM_API_KEY) {
     logError("请先设置 LLM_API_KEY 环境变量（可写在项目根目录 .env）")
@@ -198,10 +202,71 @@ function createEngine(
   registry.register(createBashTool(workDir))
   registry.register(createEditFileTool(workDir))
 
+  return { llmProvider, registry, model }
+}
+
+/**
+ * 初始化引擎依赖。
+ * 对应 Go: NewAgentEngine(llmProvider, registry, enableThinking, planMode)
+ * 返回 registry，便于在 bot 创建后挂载审批 Middleware。
+ */
+function createEngine(
+  workDir: string,
+  enableThinking = false,
+  planMode = false,
+): { eng: AgentEngine; registry: Registry } {
+  const { llmProvider, registry } = createProviderAndRegistry(workDir)
+
   // 实例化引擎；【注意】WorkDir 已从 Engine 移除，跟随 Session 走
   // 本讲默认：EnableThinking=false，PlanMode=false
   const eng = new AgentEngine(llmProvider, registry, enableThinking, planMode)
   return { eng, registry }
+}
+
+/**
+ * 对应 Go: AgentEngineFactory。
+ * 每次飞书消息按 Session 动态组装引擎，并把 CostTracker 绑到该会话账单上。
+ */
+function createEngineFactory(
+  workDir: string,
+  enableThinking = false,
+  planMode = false,
+): { factory: AgentEngineFactory; registry: Registry } {
+  const { llmProvider, registry, model } = createProviderAndRegistry(workDir)
+  const factory: AgentEngineFactory = (sess) => {
+    const tracked = createCostTracker(llmProvider, model, sess)
+    return new AgentEngine(tracked, registry, enableThinking, planMode)
+  }
+  return { factory, registry }
+}
+
+/**
+ * 高危命令审批 Middleware：从 TraceContext 取当前会话 Reporter，
+ * 对应 Go 的 feishu.ReporterFromContext(ctx)，禁止再读 bot.reporter()。
+ */
+function installApprovalMiddleware(registry: Registry): void {
+  registry.use(async (ctx, call) => {
+    const argsStr =
+      typeof call.arguments === "string"
+        ? call.arguments
+        : JSON.stringify(call.arguments ?? {})
+
+    if (isDangerousCommand(call.name, argsStr)) {
+      const taskID = call.id
+      const { allowed, reason } = await globalApprovalMgr.waitForApproval(
+        taskID,
+        call.name,
+        argsStr,
+        reporterFromContext(ctx) ?? null,
+      )
+      if (!allowed) {
+        return { allowed: false, rejectReason: reason }
+      }
+      return { allowed: true, rejectReason: "" }
+    }
+
+    return { allowed: true, rejectReason: "" }
+  })
 }
 
 /** 本讲演示用的前后端工作区（对应 Go: /tmp/project_front|back） */
@@ -546,50 +611,18 @@ async function runRepl(eng: AgentEngine, workDir: string): Promise<void> {
 
 /**
  * 飞书 HTTP Webhook 入口（本讲默认）。
- * 对应 Go main：绑定 Session + 注册高危命令审批 Middleware + 启动 :48080。
+ * 对应 Go main：AgentEngineFactory + 注册高危命令审批 Middleware + 启动 :48080。
  */
 async function runFeishuWebhook(
-  eng: AgentEngine,
+  factory: AgentEngineFactory,
   registry: Registry,
   workDir: string,
 ): Promise<void> {
-  // 假设一个 bot 绑定一个 session
-  // 对应 Go: sessionID := "test_command_intercept_001"
-  const sessionID = "test_command_intercept_001"
-  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
-  sess.append({ role: "user", content: "" })
+  // 对应 Go: bot := feishu.NewFeishuBotWithFactory(factory)
+  const bot = createFeishuBot(factory, workDir)
 
-  // 对应 Go: bot := feishu.NewFeishuBot(eng, sess)
-  const bot = createFeishuBot(eng, sess)
-
-  // 【核心注入】注册安全拦截 Middleware
-  registry.use(async (_ctx, call) => {
-    const argsStr =
-      typeof call.arguments === "string"
-        ? call.arguments
-        : JSON.stringify(call.arguments ?? {})
-
-    // 检查是否命中高危特征库
-    if (isDangerousCommand(call.name, argsStr)) {
-      const taskID = call.id // 使用大模型生成的唯一 ToolCallID 作为 TaskID
-
-      // 挂起当前异步调用，发送消息给飞书，等待人类的审批！
-      const { allowed, reason } = await globalApprovalMgr.waitForApproval(
-        taskID,
-        call.name,
-        argsStr,
-        bot.reporter(),
-      )
-
-      if (!allowed) {
-        return { allowed: false, rejectReason: reason } // 拒绝，将理由传回给大模型
-      }
-      return { allowed: true, rejectReason: "" } // 同意，放行底层工具
-    }
-
-    // 没命中黑名单，直接 YOLO 放行
-    return { allowed: true, rejectReason: "" }
-  })
+  // 【核心注入】注册安全拦截 Middleware（Reporter 从 Context 提取）
+  installApprovalMiddleware(registry)
 
   // 3. 注册路由并启动 HTTP 服务
   // 对应 Go: http.HandleFunc("/webhook/event", handler)
@@ -640,37 +673,12 @@ async function runFeishuWebhook(
  * 同样挂载审批 Middleware，与 webhook 行为一致。
  */
 async function runFeishuLongConnection(
-  eng: AgentEngine,
+  factory: AgentEngineFactory,
   registry: Registry,
   workDir: string,
 ): Promise<void> {
-  const sessionID = "test_command_intercept_001"
-  const sess = globalSessionMgr.getOrCreate(sessionID, workDir)
-  sess.append({ role: "user", content: "" })
-
-  const bot = createFeishuBot(eng, sess)
-
-  registry.use(async (_ctx, call) => {
-    const argsStr =
-      typeof call.arguments === "string"
-        ? call.arguments
-        : JSON.stringify(call.arguments ?? {})
-
-    if (isDangerousCommand(call.name, argsStr)) {
-      const taskID = call.id
-      const { allowed, reason } = await globalApprovalMgr.waitForApproval(
-        taskID,
-        call.name,
-        argsStr,
-        bot.reporter(),
-      )
-      if (!allowed) {
-        return { allowed: false, rejectReason: reason }
-      }
-      return { allowed: true, rejectReason: "" }
-    }
-    return { allowed: true, rejectReason: "" }
-  })
+  const bot = createFeishuBot(factory, workDir)
+  installApprovalMiddleware(registry)
 
   log("🚀 ts-tiny-claw 飞书长连接模式启动中…")
   log("   请在开放平台将订阅方式改为「使用长连接接收事件」")
@@ -721,13 +729,13 @@ async function main() {
       break
     }
     case "webhook": {
-      const { eng, registry } = createEngine(workDir, false, false)
-      await runFeishuWebhook(eng, registry, workDir)
+      const { factory, registry } = createEngineFactory(workDir, false, false)
+      await runFeishuWebhook(factory, registry, workDir)
       break
     }
     case "ws": {
-      const { eng, registry } = createEngine(workDir, false, false)
-      await runFeishuLongConnection(eng, registry, workDir)
+      const { factory, registry } = createEngineFactory(workDir, false, false)
+      await runFeishuLongConnection(factory, registry, workDir)
       break
     }
   }

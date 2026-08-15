@@ -6,9 +6,13 @@ import type { Client, EventDispatcher } from "@larksuiteoapi/node-sdk"
 
 import type { AgentEngine } from "../engine/loop.ts"
 import { createMultiReporter, type Reporter } from "../engine/reporter.ts"
-import type { Session } from "../engine/session.ts"
+import { globalSessionMgr, type Session } from "../engine/session.ts"
 import { createTerminalReporter } from "../engine/terminal-reporter.ts"
 import { error as logError, log } from "../log/log.ts"
+import {
+  asTraceContext,
+  type TraceContext,
+} from "../observability/trace.ts"
 import { globalApprovalMgr } from "./approval.ts"
 
 /** 飞书 im.message.receive_v1 事件的最小载荷（Node SDK 回调 data 形状） */
@@ -23,21 +27,70 @@ interface FeishuMessageEvent {
   }
 }
 
+// ==========================================
+// 1. Context 传递机制：解决并发 Reporter 的提取
+// 对应 Go: reporterKey / ContextWithReporter / ReporterFromContext
+// ==========================================
+
+/** AgentEngineFactory 允许每次收到消息时，根据 Session 动态创建引擎 */
+export type AgentEngineFactory = (session: Session) => AgentEngine
+
+/**
+ * 将专属 Reporter 封入 TraceContext（对应 Go context.WithValue(reporterKey{})）。
+ * startSpan 会把 reporter 拷到子 Context，Middleware 才能取到。
+ */
+export function contextWithReporter(
+  ctx: TraceContext | undefined,
+  reporter: Reporter,
+): TraceContext {
+  const next: TraceContext = { reporter }
+  if (ctx?.signal) next.signal = ctx.signal
+  if (ctx?.span) next.span = ctx.span
+  return next
+}
+
+/**
+ * 供底层 Middleware 提取当前会话的 Reporter，发送审批卡片。
+ * 对应 Go: ReporterFromContext(ctx)。
+ */
+export function reporterFromContext(
+  ctx: AbortSignal | TraceContext | undefined,
+): Reporter | undefined {
+  const stored = asTraceContext(ctx)?.reporter
+  if (stored && isReporter(stored)) return stored
+  return undefined
+}
+
+function isReporter(v: unknown): v is Reporter {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    "onThinking" in v &&
+    "onToolCall" in v &&
+    "onToolResult" in v &&
+    "onMessage" in v
+  )
+}
+
+// ==========================================
+// 2. 飞书 Bot 核心调度器
+// ==========================================
+
 /** FeishuBot 封装了飞书机器人的配置与核心业务流 */
 export class FeishuBot {
   readonly client: Client
   readonly appId: string
   readonly appSecret: string
-  /** 持有核心引擎引用 */
-  private readonly engine: AgentEngine
-  /** 绑定的 Session（对应第 11 讲：对话历史随 Session 走） */
-  private readonly sess: Session
-  /** 最近一次 Agent 运行绑定的 FeishuReporter（供审批 Middleware 发通知） */
-  private r: FeishuReporter | null = null
+  /** 保存从入口传来的工作区路径 */
+  private readonly workDir: string
+  /** 替换掉原来的单一 engine / session 引用 */
+  private readonly factory: AgentEngineFactory
+  /** 同一 chat 正在跑 Agent（含等待审批）时，禁止再开一条引擎 */
+  private readonly runningChats = new Set<string>()
 
   constructor(
-    engine: AgentEngine,
-    sess: Session,
+    factory: AgentEngineFactory,
+    workDir: string,
     opts?: { appId?: string; appSecret?: string },
   ) {
     const appId = opts?.appId ?? process.env.FEISHU_APP_ID ?? ""
@@ -50,8 +103,8 @@ export class FeishuBot {
 
     this.appId = appId
     this.appSecret = appSecret
-    this.engine = engine
-    this.sess = sess // 绑定 session 信息
+    this.workDir = workDir
+    this.factory = factory
 
     // 实例化飞书官方客户端
     this.client = new lark.Client({
@@ -60,11 +113,6 @@ export class FeishuBot {
       appType: lark.AppType.SelfBuild,
       domain: lark.Domain.Feishu,
     })
-  }
-
-  /** 新增：返回 FeishuBot 绑定的 Reporter */
-  reporter(): FeishuReporter | null {
-    return this.r
   }
 
   /**
@@ -111,27 +159,35 @@ export class FeishuBot {
 
         log(`[Feishu] 收到会话 ${chatId} 消息: ${contentStr}`)
 
-        // 【新增】：拦截人工审批的特殊口令
-        if (contentStr.startsWith("approve ")) {
-          const taskID = contentStr.slice("approve ".length).trim()
-          // 唤醒挂起的引擎异步调用！
+        // 拦截人工审批口令（含 pprove 等拼写误差，只要带上挂起的 TaskID）
+        const approval = parseApprovalCommand(
+          contentStr,
+          globalApprovalMgr.pendingTaskIDs(),
+        )
+        if (approval) {
           globalApprovalMgr.resolveApproval(
-            taskID,
-            true,
-            "人类管理员已批准操作",
+            approval.taskID,
+            approval.allowed,
+            approval.allowed
+              ? "人类管理员已批准操作"
+              : "人类管理员认为该操作存在极高风险，已无情拒绝",
           )
-          log(`[Feishu] 会话 ${chatId}: ✅ 已为您批准任务 ${taskID}`)
+          log(
+            `[Feishu] 会话 ${chatId}: ${approval.allowed ? "✅ 已为您批准" : "🚫 已拒绝"}任务 ${approval.taskID}`,
+          )
           return undefined
         }
-        if (contentStr.startsWith("reject ")) {
-          const taskID = contentStr.slice("reject ".length).trim()
-          // 唤醒挂起的引擎异步调用，并反馈拒绝理由！
-          globalApprovalMgr.resolveApproval(
-            taskID,
-            false,
-            "人类管理员认为该操作存在极高风险，已无情拒绝",
-          )
-          log(`[Feishu] 会话 ${chatId}: 🚫 已拒绝任务 ${taskID}`)
+
+        // 审批挂起期间再来一条普通消息，绝不能新开引擎：
+        // 否则会往未完成的 tool_calls 后面插入 user，下一轮 LLM 直接 400。
+        if (this.runningChats.has(chatId)) {
+          const pending = globalApprovalMgr.pendingTaskIDs()
+          const hint =
+            pending.length > 0
+              ? `当前任务正在等待审批，请回复：\napprove ${pending[0]}\n或\nreject ${pending[0]}`
+              : "当前会话已有任务在执行，请稍候。"
+          log(`[Feishu] 会话 ${chatId} 忙碌中，忽略新对话: ${contentStr}`)
+          void new FeishuReporter(this.client, chatId).sendMsg(hint)
           return undefined
         }
 
@@ -153,24 +209,38 @@ export class FeishuBot {
 
   /** handleAgentRun 是连接飞书与底层引擎的桥梁 */
   private async handleAgentRun(chatId: string, prompt: string): Promise<void> {
-    const feishuReporter = new FeishuReporter(this.client, chatId)
-    // 对应 Go: b.r = reporter —— 供审批 Middleware 通过 bot.Reporter() 取到发信通道
-    this.r = feishuReporter
+    this.runningChats.add(chatId)
+    try {
+      await this.runAgentOnce(chatId, prompt)
+    } finally {
+      this.runningChats.delete(chatId)
+    }
+  }
 
+  private async runAgentOnce(chatId: string, prompt: string): Promise<void> {
+    // 为当前并发请求实例化一个专属的 Reporter（不再写入 this.r）
+    const feishuReporter = new FeishuReporter(this.client, chatId)
     // 飞书回帖 + 终端旁路：本地也能看到 🤖 / 🛠️ 日志
     const reporter = createMultiReporter(
       createTerminalReporter(),
       feishuReporter,
     )
 
-    // 将 prompt 加入绑定的 Session（对应第 11 讲）
-    this.sess.append({ role: "user", content: prompt })
+    // 1. 获取物理隔离的 Session（以 chatId 为键，避免多群串台）
+    const sess = globalSessionMgr.getOrCreate(chatId, this.workDir)
+    sess.append({ role: "user", content: prompt })
 
-    log(`\n>>> 🙋‍♂️ [Session ${this.sess.id} / chat ${chatId}]: ${prompt}`)
+    // 2. 通过工厂模式，为当前会话生成挂好专属 CostTracker 的新引擎
+    const eng = this.factory(sess)
 
-    // 启动引擎！
+    // 3. 【驾驭核心】：将专属 Reporter 塞入 Context 并传给引擎
+    //    Middleware 用 reporterFromContext 取，而不是 bot.reporter()
+    const runCtx = contextWithReporter(undefined, feishuReporter)
+
+    log(`\n>>> 🙋‍♂️ [Session ${sess.id} / chat ${chatId}]: ${prompt}`)
+
     try {
-      await this.engine.run(undefined, this.sess, reporter)
+      await eng.run(runCtx, sess, reporter)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       logError("[Feishu] Agent 运行崩溃:", err)
@@ -213,12 +283,12 @@ export class FeishuBot {
   }
 }
 
-/** 工厂：对应 Go 的 NewFeishuBot(eng, sess) */
+/** 工厂：对应 Go 的 NewFeishuBotWithFactory(factory) */
 export function createFeishuBot(
-  engine: AgentEngine,
-  sess: Session,
+  factory: AgentEngineFactory,
+  workDir: string,
 ): FeishuBot {
-  return new FeishuBot(engine, sess)
+  return new FeishuBot(factory, workDir)
 }
 
 /**
@@ -246,6 +316,34 @@ function extractText(event: FeishuMessageEvent): string {
   }
 
   return ""
+}
+
+/**
+ * 解析人工审批口令。
+ * 标准：`approve <taskID>` / `reject <taskID>`
+ * 容错：消息里带了正在挂起的 TaskID（如把 approve 打成 pprove）也视为审批。
+ */
+function parseApprovalCommand(
+  text: string,
+  pendingIDs: string[],
+): { allowed: boolean; taskID: string } | null {
+  const trimmed = text.trim()
+  const exact = /^(approve|reject)\s+(\S+)/i.exec(trimmed)
+  if (exact) {
+    const action = exact[1]!.toLowerCase()
+    return { allowed: action === "approve", taskID: exact[2]! }
+  }
+
+  for (const taskID of pendingIDs) {
+    if (!trimmed.includes(taskID)) continue
+    if (/\breject\b|拒绝|deny/i.test(trimmed)) {
+      return { allowed: false, taskID }
+    }
+    if (/a?pprove|批准|同意/i.test(trimmed)) {
+      return { allowed: true, taskID }
+    }
+  }
+  return null
 }
 
 // ==========================================

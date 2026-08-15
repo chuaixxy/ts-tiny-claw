@@ -34,9 +34,12 @@ export interface BaseTool {
  * MiddlewareFunc 定义了中间件的签名。
  * 它接收当前的 ToolCall，并返回是否允许执行 (allowed)，以及拦截时的原因 (rejectReason)。
  * Node 侧允许返回 Promise，以便 WaitForApproval 异步挂起（对应 Go 里 channel 阻塞）。
+ *
+ * ctx 保留完整 TraceContext，供审批 Middleware 从中提取专属 Reporter
+ * （对应 Go: feishu.ReporterFromContext(ctx)）。
  */
 export type MiddlewareFunc = (
-  ctx: AbortSignal | undefined,
+  ctx: AbortSignal | TraceContext | undefined,
   call: ToolCall,
 ) =>
   | { allowed: boolean; rejectReason: string }
@@ -110,9 +113,10 @@ class RegistryImpl implements Registry {
       }
 
       // 2. 【核心防御】在执行底层逻辑前，依次运行所有的 Middleware
+      // 传入完整 toolCtx，而不是剥成 AbortSignal，否则 Reporter 跨界丢失
       const signal = signalOf(toolCtx)
       for (const mw of this.middlewares) {
-        const { allowed, rejectReason } = await mw(signal, call)
+        const { allowed, rejectReason } = await mw(toolCtx, call)
         if (!allowed) {
           span.addAttribute("intercepted", true)
           span.addAttribute("reject_reason", rejectReason)

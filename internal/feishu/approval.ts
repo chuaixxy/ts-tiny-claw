@@ -4,8 +4,8 @@
 // 当 Middleware 判断需要拦截时，把当前工具调用挂起；飞书 Webhook（或其它入口）
 // 在另一条异步路径上 Resolve，从而在两者之间传递放行/拒绝信号。
 
+import type { Reporter } from "../engine/reporter.ts"
 import { log } from "../log/log.ts"
-import type { FeishuReporter } from "./bot.ts"
 
 /** ApprovalResult 审批结果包 */
 export interface ApprovalResult {
@@ -34,7 +34,7 @@ export class ApprovalManager {
     taskID: string,
     toolName: string,
     args: string,
-    reporter: FeishuReporter | null,
+    reporter: Reporter | null,
   ): Promise<{ allowed: boolean; reason: string }> {
     // 1. 创建用于挂起当前引擎调用的 Promise
     const waitPromise = new Promise<ApprovalResult>((resolve) => {
@@ -52,9 +52,9 @@ Agent 试图执行以下动作:
 
 👉 请在此消息下方回复 "approve ${taskID}" 或 "reject ${taskID}" 来决定是否放行。`
 
-    // 注意：因为 Middleware 的签名里没有带 Reporter，我们在 main 里初始化时必须把 reporter 传进来
+    // Reporter 由 handleAgentRun 经 TraceContext 传入，不再从 Bot 全局字段读取
     if (reporter) {
-      await reporter.sendMsg(noticeMsg)
+      await reporter.onMessage(undefined, noticeMsg)
     } else {
       // 回退到终端打印 (兼容本地 CLI 模式)
       console.log(
@@ -71,6 +71,11 @@ Agent 试图执行以下动作:
     this.pendingTasks.delete(taskID)
 
     return { allowed: result.allowed, reason: result.reason }
+  }
+
+  /** 当前仍在等待人类审批的 TaskID 列表 */
+  pendingTaskIDs(): string[] {
+    return Array.from(this.pendingTasks.keys())
   }
 
   /** ResolveApproval 由飞书 Webhook 回调触发，向 waiter 发送信号解开挂起 */
@@ -93,37 +98,41 @@ Agent 试图执行以下动作:
 /** 全局单例，方便在 Registry Middleware 和 Feishu Webhook 之间共享状态 */
 export const globalApprovalMgr = new ApprovalManager()
 
-/** IsDangerousCommand 简单的正则检查黑名单，判断该工具调用是否需要审批 */
+/**
+ * IsDangerousCommand 简单的正则检查黑名单，判断该工具调用是否需要触发人类审批。
+ * 对应 Go: approval.go 第 22 讲剧本修正版。
+ */
 export function isDangerousCommand(toolName: string, args: string): boolean {
-  // 对于纯读取的工具，默认 YOLO 模式，全部放行
-  if (
-    toolName !== "bash" &&
-    toolName !== "write_file" &&
-    toolName !== "edit_file"
-  ) {
+  // 白名单放行：对于纯读取工具，默认 YOLO 模式，全部放行
+  if (toolName === "read_file") {
     return false
   }
 
-  // write_file / edit_file：改写工作区即视为需人工确认
-  // （Go 原版把它们列入检查范围，但末尾漏了 return true；此处补齐，便于稳定复现审批流）
+  // 【剧本设定】：在生产服务器的 AgentOps 场景下，修改任何文件都是高危操作！
+  // 我们不允许 Agent 擅自使用 write_file 覆写文件，或使用 edit_file 篡改代码。
   if (toolName === "write_file" || toolName === "edit_file") {
     return true
   }
 
   // 针对 bash 的高危模式匹配
   if (toolName === "bash") {
+    // 危险指令特征库 (模拟真实的运维黑名单)
     const dangerousPatterns = [
       /rm\s+-r/, // 级联删除
-      /sudo\s+/, // 提权
-      /drop\s+/, // 数据库删除
+      /sudo\s+/, // 提权操作
+      /drop\s+/, // 数据库危险命令
       />.*\.go/, // 恶意覆盖源代码
-      />.*\.ts/, // 恶意覆盖 TypeScript 源码
+      /nginx\s+-s/, // 【针对第 22 讲剧本】：拦截 Nginx 服务重启或停止
+      /systemctl\s+/, // 拦截系统级服务管理
+      /kill\s+/, // 拦截杀进程操作
     ]
     for (const p of dangerousPatterns) {
       if (p.test(args)) {
-        return true
+        return true // 命中任何一条黑名单，必须挂起审批
       }
     }
   }
+
+  // 如果没有命中高危特征，默认放行 (例如简单的 ls -la, tail -n 50 等探测命令)
   return false
 }
